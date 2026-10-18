@@ -281,6 +281,8 @@ def main() -> int:
         print(f"  started: https://github.com/{repo}/actions/runs/{run_id}")
 
     print(f"\nDone. Web page: https://{owner}.github.io/{name}/")
+    print("If the page is not there yet, turn Pages on once: repo Settings -> Pages -> Source: GitHub Actions,")
+    print("then run the deploy-pages workflow again.")
     print("Point your Bale bot's Mini App at that address (see README, step 3).")
     return 0
 

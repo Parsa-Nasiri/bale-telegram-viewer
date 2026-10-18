@@ -20,8 +20,10 @@ delivered to their private chat with the Bale bot.
    It asks for the seven values above once and offers to save them to a git-ignored `.env`. Then it creates
    the GitHub repository if this folder is not one yet, stores the values as GitHub secrets, runs the
    `bootstrap` workflow, asks for the Telegram login code (only if no session is stored yet), and starts the worker.
-3. **Point the Mini App at the web page.** The page is at `https://<your-user>.github.io/<repo>/`. Set it as the
-   Mini App address in the bot's settings in Bale. This one step is manual because the Bale API for it was not verified.
+3. **Turn on GitHub Pages once, then point the Mini App at it.** In your repo, go to Settings → Pages and set
+   Source to **GitHub Actions**. Run the `deploy-pages` workflow under Actions. The page is at
+   `https://<your-user>.github.io/<repo>/`. In Bale, open @BotFather and set this address as the bot's main Mini App.
+   These steps stay manual.
 
 Running `scripts/setup.py` again is safe. Use `--no-start` to stop before the worker is started.
 
@@ -38,10 +40,10 @@ Every value below is generated, derived or defaulted. You do not set any of them
 | App token signing key | Derived from the bot token: `HMAC(bot_token, "app-token:v1")` |
 | CORS | Open by default. The API takes a bearer token in a header, not cookies, so this is safe |
 | Supabase URL for the worker | Derived from the project ref |
-| GitHub Pages | Enabled by the deploy workflow on its first run. The project URL is written into the page at build time |
+| GitHub Pages | The deploy workflow builds the page and writes the project URL into it. Turning Pages on is a one-time switch you make (Settings → Pages → Source: GitHub Actions), because the built-in token cannot do it |
 | Worker chain | Starts itself after the first run; the watchdog restarts it if it stops |
 
-Only the Telegram login (a phone code) and the Mini App address in Bale stay manual.
+Only the Telegram login (a phone code), the one-time GitHub Pages switch, and the Mini App address in Bale stay manual.
 
 ## Architecture
 
@@ -133,7 +135,7 @@ Checked during the build:
 - Python worker: 73 unit tests. `cd worker && python -m unittest discover -s tests -t .`
 - Edge Function logic: 64 tests against an in-memory database fake. `node --test "supabase/functions/tests/*.test.ts"`
   (Node 22.18 or newer, which strips types without a build step)
-- Frontend: 20 tests. `cd frontend && node --test "tests/*.test.js"`
+- Frontend: 25 tests. `cd frontend && node --test "tests/*.test.js"`
 - The webhook path is computed the same way in Python and TypeScript (checked against one shared test vector).
 
 Not verified (these need a live run before go-live):
@@ -141,12 +143,13 @@ Not verified (these need a live run before go-live):
 - The setup script against real GitHub and Supabase. Its steps were written, but not run.
 - Supabase CLI commands in `bootstrap.yml` (`link`, `db push`, `secrets set`, `functions deploy`) and whether
   `db push` needs the confirmation answer the workflow supplies.
-- Automatic GitHub Pages enablement through `configure-pages` with `enablement: true`.
+- Automatic GitHub Pages enablement. In a live run the built-in token failed with "Resource not accessible by
+  integration", so Pages is turned on by hand (Quick start, step 3).
 - The Bale `setWebhook` parameter names. The docs.bale.ai Bot API page was read for limits, but not for this call.
 - Live Telegram behavior through Telethon, live Bale API calls, and live Supabase and PGMQ. The `pgmq.*` functions
   used by migration 003 were not run against a database.
-- The Bale Mini App `initData` algorithm and SDK. The code uses the Telegram Mini App scheme with the bot token as
-  the key. `docs.bale.ai/miniapp` disallows automated access, so it was not read, and it was not bypassed.
+- Live Bale Mini App login. The SDK script (`https://tapi.bale.ai/miniapp.js`), the `window.Bale.WebApp` object and
+  the `initData` check match Bale's Mini App documentation, but none of it has run live yet.
 - The Deno runtime for the Edge Functions. Tests run under Node; the code uses only Web-standard APIs, and it assumes
   Supabase provides `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to functions.
 - TypeScript type-checking. The build environment could not reach the npm registry.
@@ -157,5 +160,24 @@ Known limitations:
   edge is fetched.
 - A hand-off gap of about a minute happens each cycle, about every 5.5 hours.
 - A channel's first view can take as long as the chain takes to pick up the request.
+- Bale's web client shows Mini Apps in a frame, and Bale's docs require the page's headers to allow that. GitHub
+  Pages sets its own headers and they cannot be changed here. If the Mini App opens in the Bale app but not in
+  Bale web, check this first.
 - Before `scripts/setup.py` has run, the watchdog and the first pushes may show failed runs. They are expected
   and stop once the setup is complete.
+
+## Troubleshooting
+
+- **The page address shows a 404 ("There isn't a GitHub Pages site here"):** Pages is not turned on yet. Go to
+  Settings → Pages, set Source to GitHub Actions, then run `deploy-pages` under Actions.
+
+- **The page shows a Persian message saying it was not opened inside Bale, or that Bale sent no login data:** the
+  page was opened outside Bale, or the SDK script in `frontend/index.html` did not load. Open the Mini App from the
+  bot inside Bale (the app or Bale web), not by pasting the link into a plain browser tab.
+- **Opening a channel does nothing:** in Supabase, check `page_requests`. A new row means the API got the request,
+  and the worker should pick it up. No row means the page never reached the API, so look at the page first.
+- **Worker run shows only Telegram update lines:** that is normal when nothing is queued. The worker logs only
+  failures and warnings for requests and jobs, so a healthy run looks quiet. Check `page_requests` and
+  `download_jobs` in Supabase to see what it handled.
+- **Downloads fail with `BALE_CHAT_REQUIRED`:** the user has not written to the Bale bot yet, so no private chat id
+  is stored. Send any message to the bot once.

@@ -1,13 +1,12 @@
 // Mini App initData validation.
 //
-// Algorithm used (Telegram Mini Apps scheme):
+// Algorithm (Bale's Mini App docs describe the same scheme as Telegram's):
 //   secret = HMAC-SHA256(key = "WebAppData", message = bot_token)
 //   data_check_string = all fields except `hash`, as "key=value", sorted by key, joined with "\n"
 //   expected = hex(HMAC-SHA256(key = secret, message = data_check_string))
 //
-// NOTE: Bale's Mini App documentation could not be read during the build. Before going live, confirm
-// this scheme against docs.bale.ai/miniapp (sections on initData and validation). This file is the only
-// place that needs to change if Bale differs.
+// Checked against Bale's Mini App docs (initData validation section). Live testing is still needed. This file is
+// the only place that changes if Bale differs.
 
 import { bytesToHex, encoder, hmacSha256, timingSafeEqualString } from "./crypto.ts";
 import { HttpError } from "./http.ts";

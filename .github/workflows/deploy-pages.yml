@@ -1,5 +1,6 @@
-# Publishes the static viewer (frontend/) to GitHub Pages. No manual Pages setup:
-# configure-pages turns Pages on by itself the first time. The Supabase project URL is filled in at build time
+# Publishes the static viewer (frontend/) to GitHub Pages. Pages must be turned on once by hand:
+# Settings -> Pages -> Source: GitHub Actions. The built-in token cannot turn it on ("Resource not accessible by
+# integration"). The Supabase project URL is filled in at build time
 # from the SUPABASE_PROJECT_REF secret, so the committed config keeps a placeholder and nothing private is committed.
 # Until that secret exists, the job skips itself instead of failing (for example on the very first push).
 
@@ -44,7 +45,7 @@ jobs:
             echo "SUPABASE_PROJECT_REF is not set yet, so the page is skipped. Run scripts/setup.py first."
           fi
 
-      - name: Configure Pages (turns Pages on the first time)
+      - name: Configure Pages
         if: steps.check.outputs.ready == 'true'
         uses: actions/configure-pages@v5
         with:

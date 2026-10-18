@@ -1,7 +1,7 @@
 // Page controller: channel lookup, the timeline with older-page loading, and file delivery.
 
 import { ApiError, createApi } from "./api-client.js";
-import { getInitData, getWebApp } from "./bale-miniapp.js";
+import { readInitData } from "./bale-miniapp.js";
 import { CONFIG } from "./config.js";
 import { deliverMessage } from "./download-actions.js";
 import { errorLabel, jobStatusLabel } from "./labels.js";
@@ -22,6 +22,12 @@ const els = {
 };
 
 const MAX_FETCH_ROUNDS = 3;
+
+// Shown when the page has no initData. Each message points at a different cause.
+const NO_AUTH_MESSAGES = {
+  "no-sdk": "این صفحه داخل بله باز نشده است، یا SDK بله در آن بارگذاری نشده است.",
+  "sdk-without-initdata": "بله اطلاعات ورود را نفرستاده است. صفحه را از داخل ربات بله دوباره باز کنید.",
+};
 const mock = new URLSearchParams(location.search).get("mock") === "1";
 const api = mock ? createMockApi() : createApi();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -196,12 +202,11 @@ async function boot() {
     setStatus("حالت نمایشی: داده‌ها ساختگی هستند.");
     return;
   }
-  state.initData = getInitData();
-  if (!state.initData) {
-    setStatus(
-      getWebApp() ? "نشست بله پیدا نشد. صفحه را دوباره باز کنید." : "این صفحه باید داخل ربات بله باز شود.",
-      true,
-    );
+  const { initData, source } = readInitData();
+  state.initData = initData;
+  if (!initData) {
+    console.info("bale auth: no initData, source =", source);
+    setStatus(NO_AUTH_MESSAGES[source] ?? NO_AUTH_MESSAGES["no-sdk"], true);
     els.openButton.disabled = true;
     return;
   }
