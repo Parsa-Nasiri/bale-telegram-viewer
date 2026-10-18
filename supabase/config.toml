@@ -1,0 +1,12 @@
+# Supabase CLI project settings.
+# Both functions turn off the platform JWT check on purpose:
+#   - `api` uses its own short-lived app token, verified in code (a Supabase JWT would be the wrong credential).
+#   - `bale-webhook` is called by Bale, which sends no Supabase JWT; it is gated by a secret path segment.
+
+project_id = "bale-telegram-viewer"
+
+[functions.api]
+verify_jwt = false
+
+[functions.bale-webhook]
+verify_jwt = false

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>نمایشگر کانال</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <!-- Bale Mini App SDK: add its <script> tag here once the URL is confirmed from docs.bale.ai/miniapp. -->
+</head>
+<body>
+  <header class="topbar">
+    <form id="channel-form" class="channel-form" autocomplete="off">
+      <input id="channel-input" name="username" type="text" dir="ltr" inputmode="latin"
+             placeholder="@channel" aria-label="یوزرنیم کانال" required maxlength="40">
+      <button type="submit" id="open-btn">باز کردن</button>
+    </form>
+    <div id="channel-title" class="channel-title" aria-live="polite"></div>
+  </header>
+
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <main id="timeline" class="timeline" aria-label="پیام‌های کانال">
+    <div id="older-indicator" class="older-indicator" hidden>در حال بارگذاری پیام‌های قدیمی‌تر…</div>
+    <div id="message-list" class="message-list"></div>
+  </main>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

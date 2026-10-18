@@ -1,0 +1,9 @@
+{
+  "name": "bale-telegram-viewer-frontend",
+  "private": true,
+  "type": "module",
+  "description": "Static viewer for the Bale Mini App. No build step; GitHub Pages serves this folder as-is.",
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\""
+  }
+}

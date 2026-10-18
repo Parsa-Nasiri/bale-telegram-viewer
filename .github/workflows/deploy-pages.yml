@@ -1,0 +1,74 @@
+# Publishes the static viewer (frontend/) to GitHub Pages. No manual Pages setup:
+# configure-pages turns Pages on by itself the first time. The Supabase project URL is filled in at build time
+# from the SUPABASE_PROJECT_REF secret, so the committed config keeps a placeholder and nothing private is committed.
+# Until that secret exists, the job skips itself instead of failing (for example on the very first push).
+
+name: deploy-pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check that the project ref is set
+        id: check
+        env:
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          if [ -n "$PROJECT_REF" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "SUPABASE_PROJECT_REF is not set yet, so the page is skipped. Run scripts/setup.py first."
+          fi
+
+      - name: Configure Pages (turns Pages on the first time)
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Build the site folder
+        if: steps.check.outputs.ready == 'true'
+        env:
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          rm -rf _site && mkdir _site && cp -R frontend/. _site/
+          sed -i "s|YOUR-PROJECT-REF|${PROJECT_REF}|g" _site/js/config.js
+          if grep -q "YOUR-PROJECT-REF" _site/js/config.js; then
+            echo "the project ref was not written into the config"
+            exit 1
+          fi
+
+      - name: Upload the site
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy
+        if: steps.check.outputs.ready == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4

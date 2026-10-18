@@ -1,0 +1,49 @@
+# Safety net for the worker chain. It does not do the normal hand-off; the chain does that.
+# It runs when a run has stalled (stale heartbeat), or when nothing is running or queued, and then it
+# cancels the stalled run and starts a new chain. Scheduled runs can be delayed by GitHub, which is
+# why the chain itself, not this job, is the primary mechanism.
+
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: worker-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: watchdog
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: worker
+    env:
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WORKFLOW_FILE: telegram-bale-worker.yml
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check the worker chain
+        run: python -m bale_viewer_worker watchdog

@@ -1,0 +1,2 @@
+# Telethon is the only third-party dependency. Everything else is standard library.
+telethon>=1.36,<2

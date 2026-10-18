@@ -1,0 +1,25 @@
+# Secrets and local state. Telegram session files are account credentials.
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Supabase CLI
+supabase/.branches/
+supabase/.temp/
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/

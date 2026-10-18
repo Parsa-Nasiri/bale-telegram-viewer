@@ -1,0 +1,63 @@
+# The worker chain. Each run lasts at most about 5.5 hours and queues its own successor at the start,
+# so the next run is already waiting when this one ends:
+#   - the concurrency group allows one running and one pending run; cancel-in-progress is false, so the
+#     pending successor waits for the running one instead of cancelling it;
+#   - a pending run uses no minutes until it starts;
+#   - a successor queued with GITHUB_TOKEN starts a new run (workflow_dispatch is the one event that
+#     GITHUB_TOKEN may trigger), which is why this workflow needs `actions: write`.
+# Only one run can hold the Telegram session at a time, so the session is never used from two IPs at once.
+
+name: telegram-bale-worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: telegram-session-lock
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    name: worker
+    runs-on: ubuntu-latest
+    # GitHub caps a job at 360 minutes. The worker exits at 5h30m (330 min) on its own;
+    # this limit is only a backstop.
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: worker
+    env:
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      # The built-in token. It is used only to queue the successor run and to read run status.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WORKFLOW_FILE: telegram-bale-worker.yml
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Supabase, Telegram session and Bale token
+        run: python -m bale_viewer_worker healthcheck
+
+      - name: Queue the successor run
+        run: python -m bale_viewer_worker dispatch-successor
+
+      - name: Process queued jobs until the drain deadline
+        run: python -m bale_viewer_worker run --drain-after 5h15m --hard-stop 5h30m
