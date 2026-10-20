@@ -1,7 +1,7 @@
 // Page controller: channel lookup, the timeline with older-page loading, and file delivery.
 
 import { ApiError, createApi } from "./api-client.js";
-import { readInitData } from "./bale-miniapp.js";
+import { applyTheme, readInitData } from "./bale-miniapp.js";
 import { CONFIG } from "./config.js";
 import { deliverMessage } from "./download-actions.js";
 import { errorLabel, jobStatusLabel } from "./labels.js";
@@ -104,6 +104,7 @@ async function loadChannel(channel) {
   state.nextCursor = null;
   state.hasMore = false;
   els.title.textContent = channel.title || `@${channel.username}`;
+  messageList.showSkeleton();
 
   const page = await fetchPage(channel.id, undefined);
   state.messages = page.items;
@@ -149,6 +150,11 @@ function statusText(snapshot) {
   return snapshot.status === "failed" ? errorLabel(snapshot.errorCode) : jobStatusLabel(snapshot.status);
 }
 
+/**
+ * Starts a download. The bot then asks the user to accept it in the chat. The button stays disabled while the
+ * job is running. It comes back for failed, declined and timed-out jobs. An ambiguous job stays disabled,
+ * because the file may already be in the chat.
+ */
 async function handleDownload(message, button) {
   if (!state.channel) return;
   const channelId = state.channel.id;
@@ -166,8 +172,7 @@ async function handleDownload(message, button) {
       maxAttempts: CONFIG.downloadPollAttempts,
       sleep,
     });
-    // A failed delivery can be retried. An ambiguous one stays disabled: the file may already be in the chat.
-    if (result.status === "failed") button.disabled = false;
+    if (["failed", "declined", "timeout"].includes(result.status)) button.disabled = false;
   } catch (err) {
     messageList.setDownloadStatus(message.id, errorLabel(err?.code));
     button.disabled = false;
@@ -184,6 +189,7 @@ els.form.addEventListener("submit", async (event) => {
     await loadChannel(channel);
   } catch (err) {
     setStatus(errorLabel(err?.code), true);
+    if (state.messages.length === 0) messageList.setAll([]);
   } finally {
     els.openButton.disabled = false;
   }
@@ -203,6 +209,7 @@ async function boot() {
     return;
   }
   const { initData, source } = readInitData();
+  applyTheme();
   state.initData = initData;
   if (!initData) {
     console.info("bale auth: no initData, source =", source);

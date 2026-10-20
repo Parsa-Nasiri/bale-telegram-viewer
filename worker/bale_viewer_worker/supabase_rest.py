@@ -73,6 +73,12 @@ class SupabaseRest:
             or []
         )
 
+    def insert(self, table: str, row: dict) -> dict:
+        rows = self._call("POST", table, body=[row], prefer="return=representation") or []
+        if not rows:
+            raise StoreError(0, f"insert into {table} returned no row")
+        return rows[0]
+
     def update(self, table: str, filters: Mapping[str, str], values: Mapping[str, Any]) -> list[dict]:
         return (
             self._call("PATCH", table, params=filters, body=dict(values), prefer="return=representation") or []

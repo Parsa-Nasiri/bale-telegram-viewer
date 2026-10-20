@@ -13,6 +13,16 @@ test("ambiguous deliveries are terminal and say the file is not re-sent", () => 
   assert.match(jobStatusLabel("ambiguous"), /دوباره ارسال نمی‌شود/);
 });
 
+test("a waiting card asks for the answer in the bot chat and is not terminal", () => {
+  assert.match(jobStatusLabel("awaiting_confirmation"), /چت بله/);
+  assert.equal(TERMINAL_JOB_STATES.has("awaiting_confirmation"), false);
+});
+
+test("a declined card is terminal and says so", () => {
+  assert.ok(TERMINAL_JOB_STATES.has("declined"));
+  assert.equal(jobStatusLabel("declined"), "لغو شد.");
+});
+
 test("formatBytes picks the unit by size and ignores invalid values", () => {
   assert.equal(formatBytes(500), "500 بایت");
   assert.equal(formatBytes(2048), "2.0 کیلوبایت");

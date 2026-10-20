@@ -1,8 +1,11 @@
-// Renders the timeline with DOM APIs only (createElement, textContent). Message text is never parsed as markup.
+// Renders the timeline with DOM APIs only (createElement, textContent, property assignment). Message text is never
+// parsed as markup. A thumbnail is set as an image source only after safeThumbSource() accepts it.
 
 import { formatBytes, mediaLabel } from "./labels.js";
+import { safeThumbSource } from "./thumbnail.js";
 
 const dateFormat = new Intl.DateTimeFormat("fa-IR", { dateStyle: "short", timeStyle: "short" });
+const SKELETON_WIDTHS = [64, 42, 76];
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -37,6 +40,19 @@ export class MessageList {
     this.#container.prepend(this.#fragment(messages));
   }
 
+  /** Placeholder bubbles while a channel loads. The next setAll() replaces them. */
+  showSkeleton() {
+    this.#container.replaceChildren();
+    this.#nodes.clear();
+    const fragment = document.createDocumentFragment();
+    for (const width of SKELETON_WIDTHS) {
+      const line = element("div", "skeleton");
+      line.style.width = `${width}%`;
+      fragment.append(line);
+    }
+    this.#container.append(fragment);
+  }
+
   setDownloadStatus(messageId, text) {
     const status = this.#nodes.get(messageId)?.querySelector(".download-status");
     if (status) status.textContent = text;
@@ -56,6 +72,8 @@ export class MessageList {
   #bubble(message) {
     const bubble = element("article", "bubble");
     bubble.dataset.messageId = String(message.id);
+    const thumb = this.#thumb(message);
+    if (thumb) bubble.append(thumb);
     if (message.senderName) bubble.append(element("div", "sender", message.senderName));
     if (message.mediaType) bubble.append(this.#media(message));
     if (message.text) bubble.append(element("p", "text", message.text));
@@ -63,6 +81,18 @@ export class MessageList {
     time.dateTime = message.date;
     bubble.append(time);
     return bubble;
+  }
+
+  #thumb(message) {
+    const source = safeThumbSource(message.thumb);
+    if (!source) return null;
+    const image = document.createElement("img");
+    image.className = "thumb";
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.src = source;
+    return image;
   }
 
   #media(message) {

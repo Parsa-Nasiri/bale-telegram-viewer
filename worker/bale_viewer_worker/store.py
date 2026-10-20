@@ -6,12 +6,23 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
-from .policy import JOB_TRANSITIONS, PAGE_TRANSITIONS, can_transition
+from .policy import (
+    ACTIVE_JOB_STATES,
+    AWAITING_STATE,
+    JOB_TRANSITIONS,
+    LOOKUP_TRANSITIONS,
+    PAGE_TRANSITIONS,
+    can_transition,
+    is_live_job,
+)
 from .supabase_rest import SupabaseRest
 
 JOB_TABLE = "download_jobs"
 PAGE_TABLE = "page_requests"
+LOOKUP_TABLE = "lookup_requests"
 _MESSAGE_BATCH = 200
+_TRANSITIONS = {JOB_TABLE: JOB_TRANSITIONS, PAGE_TABLE: PAGE_TRANSITIONS, LOOKUP_TABLE: LOOKUP_TRANSITIONS}
+_LIVE_STATES = ",".join([AWAITING_STATE, *sorted(ACTIVE_JOB_STATES)])
 
 
 def utc_now_iso() -> str:
@@ -84,21 +95,48 @@ class Store:
             "channel_id",
         )
 
-    # --- page requests and download jobs ------------------------------------------------
+    # --- page requests, lookups and download jobs ----------------------------------------
     def get_page_request(self, request_id: str) -> dict | None:
         rows = self._rest.select(PAGE_TABLE, {"select": "*", "id": f"eq.{request_id}"})
+        return rows[0] if rows else None
+
+    def get_lookup(self, lookup_id: str) -> dict | None:
+        rows = self._rest.select(LOOKUP_TABLE, {"select": "*", "id": f"eq.{lookup_id}"})
         return rows[0] if rows else None
 
     def get_job(self, job_id: str) -> dict | None:
         rows = self._rest.select(JOB_TABLE, {"select": "*", "id": f"eq.{job_id}"})
         return rows[0] if rows else None
 
+    def insert_job(self, row: dict) -> dict:
+        return self._rest.insert(JOB_TABLE, row)
+
+    def set_job_confirm_message(self, job_id: str, message_id: str) -> None:
+        self._rest.update(
+            JOB_TABLE,
+            {"id": f"eq.{job_id}"},
+            {"confirm_message_id": message_id, "updated_at": utc_now_iso()},
+        )
+
+    def live_jobs(self, user_id: str, now: datetime) -> list[dict]:
+        """The user's jobs that still hold a download slot (awaiting cards that have not expired included)."""
+        rows = self._rest.select(
+            JOB_TABLE,
+            {
+                "select": "id,channel_id,message_id,status,created_at",
+                "user_id": f"eq.{user_id}",
+                "status": f"in.({_LIVE_STATES})",
+                "limit": "50",
+            },
+        )
+        return [row for row in rows if is_live_job(row["status"], row.get("created_at"), now)]
+
     def cas(self, table: str, row: dict, to_status: str, **fields: Any) -> bool:
         """Move `row` to `to_status` only if its stored status is still the one we last read.
 
         Returns False when another writer changed it first. The row dict is refreshed on success.
         """
-        transitions = JOB_TRANSITIONS if table == JOB_TABLE else PAGE_TRANSITIONS
+        transitions = _TRANSITIONS.get(table, PAGE_TRANSITIONS)
         if not can_transition(transitions, row["status"], to_status):
             raise ValueError(f"illegal {table} transition {row['status']} -> {to_status}")
         rows = self._rest.update(

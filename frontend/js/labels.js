@@ -1,6 +1,8 @@
 // Persian UI strings and status mapping. Pure, so it is covered by Node tests.
 
 export const JOB_STATUS_LABELS = Object.freeze({
+  awaiting_confirmation: "منتظر تأیید شما در چت بله. روی «تأیید دانلود» بزنید.",
+  declined: "لغو شد.",
   queued: "در صف ارسال",
   processing: "در حال آماده‌سازی",
   downloading: "در حال دریافت از تلگرام",
@@ -11,10 +13,13 @@ export const JOB_STATUS_LABELS = Object.freeze({
   timeout: "هنوز نتیجه‌ای نیست. بعداً دوباره بررسی کنید.",
 });
 
-export const TERMINAL_JOB_STATES = new Set(["succeeded", "failed", "ambiguous"]);
+export const TERMINAL_JOB_STATES = new Set(["succeeded", "failed", "ambiguous", "declined"]);
 
 const ERROR_LABELS = Object.freeze({
   BALE_CHAT_REQUIRED: "برای دریافت فایل، ابتدا در ربات بله یک پیام بفرستید.",
+  BALE_SEND_FAILED: "کارت تأیید در چت بله فرستاده نشد. دوباره امتحان کنید.",
+  CONFIRM_SEND_FAILED: "کارت تأیید در چت بله فرستاده نشد. دوباره امتحان کنید.",
+  CONFIRM_EXPIRED: "مهلت تأیید این درخواست گذشت. دوباره درخواست دهید.",
   MESSAGE_NOT_FOUND: "این پیام دیگر در دسترس نیست.",
   MEDIA_UNAVAILABLE: "این پیام فایل قابل دریافت ندارد.",
   FILE_TOO_LARGE: "حجم فایل از حد مجاز بله بیشتر است.",

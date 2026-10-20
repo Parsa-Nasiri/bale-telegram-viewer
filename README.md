@@ -25,7 +25,8 @@ delivered to their private chat with the Bale bot.
    `https://<your-user>.github.io/<repo>/`. In Bale, open @BotFather and set this address as the bot's main Mini App.
    These steps stay manual.
 
-Running `scripts/setup.py` again is safe. Use `--no-start` to stop before the worker is started.
+Running `scripts/setup.py` again is safe. Use `--no-start` to stop before the worker is started. After a later code
+change, use `python3 scripts/update.py` instead (see "Updating after a code change" below).
 
 ## What the setup does for you
 
@@ -105,6 +106,54 @@ worker/                    Python worker: Telegram → cache, queue → Bale
 .github/workflows/         bootstrap, worker chain, watchdog, Pages deploy, tests
 ```
 
+## Updating after a code change
+
+Once setup has run, do not run `setup.py` again for code changes. Run this instead, from the repository folder:
+
+```sh
+python3 scripts/update.py
+```
+
+It uploads the files that changed to your GitHub repository as one commit, runs the `bootstrap` workflow again
+(migrations, Edge Functions, webhook, web page), and checks that the API and the web page answer. It does not need git,
+and it never uploads `.env`. It does not ask for the Telegram login again. The running worker uses the new code from
+its next hand-off.
+
+If your repository is not named `bale-telegram-viewer` under your GitHub account, give its name:
+
+```sh
+python scripts\update.py --repo YOUR-USERNAME/YOUR-REPO-NAME
+```
+
+- `--no-push`: skip the upload, for example when the files are already on GitHub.
+- `--secrets`: also re-send the values from `.env` to GitHub secrets. Use it after changing a value such as the
+  Bale token.
+- `--restart-worker`: cancel the active worker run and start a new one now, so changes to the worker and to the
+  bot's replies take effect at once. Without it they take effect at the next hand-off (about every 5 hours).
+  If no worker run is active, nothing is started.
+
+## Downloads, lookups and thumbnails
+
+**Download with confirmation.** Tapping *دریافت فایل* in the Mini App does not start the download. The bot sends
+the user a card in their private chat: the thumbnail (when the message has one), the channel, message id, date,
+file name, size, sender and the start of the text, with two buttons, *تأیید دانلود* (accept) and *لغو* (decline).
+Only Accept queues the file for the worker. Decline cancels it. A card expires after 30 minutes, and a tap after
+that is refused. Tapping Accept twice queues the file once. The job's status is `awaiting_confirmation` until the
+user answers, then `queued` (accepted) or `declined`.
+
+**Lookup in the bot chat.** Send the bot a Telegram message link (`https://t.me/channel/123`) or an identifier
+(`@channel/123`). The worker fetches that message and sends the same card. If the file can be delivered, the card
+has the two buttons. The lookup also caches the message, so it appears in the Mini App. Each user can make 30
+lookups per hour.
+
+**Thumbnails.** The smallest Telegram thumbnail of a media message is stored with the message, as a JPEG or PNG
+data URL of about 29 KB at most. Messages without a usable thumbnail show the file box only.
+
+Where the code lives: the `api` function builds and sends the download card (`_shared/card.ts`, `_shared/bale.ts`);
+`bale-webhook` handles lookups and the Accept and Decline taps (`_shared/webhook.ts`); the worker builds the lookup
+card (`worker/bale_viewer_worker/card.py`). The two card builders follow the same rules, and both test suites check
+the same expected text.
+
 ## Operations
 
 - **Stop the chain:** disable `telegram-bale-worker` and cancel the pending run in Actions, and disable the
@@ -132,10 +181,10 @@ worker/                    Python worker: Telegram → cache, queue → Bale
 
 Checked during the build:
 
-- Python worker: 73 unit tests. `cd worker && python -m unittest discover -s tests -t .`
-- Edge Function logic: 64 tests against an in-memory database fake. `node --test "supabase/functions/tests/*.test.ts"`
+- Python worker: 98 unit tests. `cd worker && python -m unittest discover -s tests -t .`
+- Edge Function logic: 98 tests against an in-memory database fake. `node --test "supabase/functions/tests/*.test.ts"`
   (Node 22.18 or newer, which strips types without a build step)
-- Frontend: 25 tests. `cd frontend && node --test "tests/*.test.js"`
+- Frontend: 35 tests. `cd frontend && node --test "tests/*.test.js"`
 - The webhook path is computed the same way in Python and TypeScript (checked against one shared test vector).
 
 Not verified (these need a live run before go-live):
@@ -148,10 +197,21 @@ Not verified (these need a live run before go-live):
 - The Bale `setWebhook` parameter names. The docs.bale.ai Bot API page was read for limits, but not for this call.
 - Live Telegram behavior through Telethon, live Bale API calls, and live Supabase and PGMQ. The `pgmq.*` functions
   used by migration 003 were not run against a database.
+- The `/start` button reply (`sendMessage` with a `web_app` inline button) has not run against Bale yet. The button's
+  format follows Bale's Mini App docs.
 - Live Bale Mini App login. The SDK script (`https://tapi.bale.ai/miniapp.js`), the `window.Bale.WebApp` object and
   the `initData` check match Bale's Mini App documentation, but none of it has run live yet.
 - The Deno runtime for the Edge Functions. Tests run under Node; the code uses only Web-standard APIs, and it assumes
   Supabase provides `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to functions.
+- Bale's Bot API calls used by the confirmation flow: `sendPhoto` (multipart upload), `sendMessage` with an inline
+  keyboard, `answerCallbackQuery`, `editMessageReplyMarkup`, and the `callback_query` update that a button tap sends
+  (its `from`, `message` and `data` fields are read the way Telegram sends them). Bale's docs read so far do not
+  describe these. A card whose photo is refused is sent as text, but if the Accept and Decline buttons do nothing,
+  check these calls first.
+- Telethon's thumbnail download (`download_media(..., thumb=0)`) on live messages.
+- Bale's theme key names (`bg_color`, `text_color`, `hint_color`, `link_color`, and so on). The page uses them only
+  when the SDK provides them, and it keeps its own colors otherwise.
+- The Vazirmatn font from Google Fonts. Without it the page uses Tahoma or the system font.
 - TypeScript type-checking. The build environment could not reach the npm registry.
 
 Known limitations:
@@ -168,6 +228,9 @@ Known limitations:
 
 ## Troubleshooting
 
+- **Testing the bot's button:** run `python scripts\bot_check.py` after you send `/start` to the bot. It checks the
+  API and the web page, finds your chat, and sends the button. If Bale refuses the button, it prints Bale's reason.
+
 - **The page address shows a 404 ("There isn't a GitHub Pages site here"):** Pages is not turned on yet. Go to
   Settings → Pages, set Source to GitHub Actions, then run `deploy-pages` under Actions.
 
@@ -181,3 +244,12 @@ Known limitations:
   `download_jobs` in Supabase to see what it handled.
 - **Downloads fail with `BALE_CHAT_REQUIRED`:** the user has not written to the Bale bot yet, so no private chat id
   is stored. Send any message to the bot once.
+- **Accept or Decline does nothing:** check the `bale-webhook` function logs in Supabase. If no request arrives after
+  a tap, Bale does not send button taps to the webhook in this form (see the unverified list). The card's buttons
+  then show nothing useful, and the job expires after 30 minutes.
+- **A link sent to the bot gets no answer:** check `lookup_requests` in Supabase. `failed` rows carry an
+  `error_code`, and the bot also tells the user why for missing channels and messages. A row that stays `queued`
+  means the worker has not picked it up yet. If it stays that way for a while, run
+  `python3 scripts/update.py --restart-worker`.
+- **The worker still runs old code after an update:** run `python3 scripts/update.py --restart-worker`. Without the
+  flag, the new code starts at the next hand-off, about every 5 hours.

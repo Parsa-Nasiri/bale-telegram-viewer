@@ -10,8 +10,10 @@ It does only what changes after the first setup:
   3. runs the `bootstrap` workflow again: database migrations, Edge Functions, Bale webhook, web page,
   4. checks that the API and the web page answer.
 
-It does not ask for the Telegram login again and does not start another worker chain. The running worker reads the
-code when each run starts, so it uses the new code from its next hand-off.
+It does not ask for the Telegram login again. The running worker reads the code when each run starts, so by default it
+uses the new code from its next hand-off (about every 5 hours). Pass --restart-worker to switch to the new code now:
+it cancels the active worker run and starts a fresh one. Use it after changes to the worker or to the bot's replies.
+If no worker run is active, nothing is started, so a chain you stopped stays stopped.
 
 Needs: Python 3.9+ and the GitHub CLI logged in (the same as setup.py). Standard library only. Running it again is
 safe. If your repository is not named bale-telegram-viewer under your account, pass it: --repo OWNER/NAME
@@ -25,6 +27,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -133,6 +136,46 @@ def upload_changes(gh: str, repo: str) -> None:
     print(f"  uploaded as one commit: {message}")
 
 
+WORKER_WORKFLOW = "telegram-bale-worker.yml"
+IDLE_TIMEOUT_SECONDS = 300
+
+
+def worker_run_ids(gh: str, repo: str) -> list[str]:
+    """Ids of the worker runs that are running or waiting for the session lock."""
+    ids: list[str] = []
+    for status in ("in_progress", "queued"):
+        result = run(
+            [gh, "run", "list", "--repo", repo, "--workflow", WORKER_WORKFLOW, "--status", status,
+             "--json", "databaseId", "--limit", "20"],
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ids.extend(str(row["databaseId"]) for row in json.loads(result.stdout))
+    return ids
+
+
+def restart_worker(gh: str, repo: str) -> None:
+    ids = worker_run_ids(gh, repo)
+    if not ids:
+        print("  no worker run is active. The next one starts with the new code.")
+        return
+    print(f"  cancelling {len(ids)} worker run(s); the old code stops here")
+    for run_id in ids:
+        run([gh, "run", "cancel", run_id, "--repo", repo], check=False)
+
+    # The session lock lets one run go at a time, so the new run waits until the old one has stopped.
+    deadline = time.monotonic() + IDLE_TIMEOUT_SECONDS
+    while worker_run_ids(gh, repo):
+        if time.monotonic() > deadline:
+            die("the old worker run did not stop within 5 minutes. Cancel it in the Actions tab, then run this "
+                "script again with --restart-worker.")
+        time.sleep(10)
+
+    run([gh, "workflow", "run", WORKER_WORKFLOW, "--repo", repo])
+    print("  started the worker with the new code.")
+    print(f"  its log: https://github.com/{repo}/actions/workflows/{WORKER_WORKFLOW}")
+
+
 def values_from_env() -> dict[str, str]:
     saved = read_env_file()
     missing = [name for name in NAMES if not saved.get(name)]
@@ -158,11 +201,17 @@ def main() -> int:
     parser.add_argument("--repo", help="your repository as OWNER/NAME (default: your account + bale-telegram-viewer)")
     parser.add_argument("--no-push", action="store_true", help="do not upload changed files to GitHub")
     parser.add_argument("--secrets", action="store_true", help="re-send the values from .env to GitHub secrets")
+    parser.add_argument(
+        "--restart-worker",
+        action="store_true",
+        help="cancel the active worker run and start a new one now, so the new code runs at once",
+    )
     args = parser.parse_args()
     if sys.version_info < (3, 9):
         die("Python 3.9 or newer is required")
 
-    say("1/4", "Uploading your changed files")
+    total = 5 if args.restart_worker else 4
+    say(f"1/{total}", "Uploading your changed files")
     gh = require_gh()
     repo = resolve_repo(gh, args.repo)
     print(f"  repository: {repo}")
@@ -171,18 +220,22 @@ def main() -> int:
     else:
         upload_changes(gh, repo)
 
-    say("2/4", "Secrets")
+    say(f"2/{total}", "Secrets")
     if args.secrets:
         set_secrets(gh, repo, values_from_env())
     else:
         print("  unchanged (run with --secrets after changing a value in .env)")
 
-    say("3/4", "Bootstrap: database, Edge Functions, webhook, web page")
+    say(f"3/{total}", "Bootstrap: database, Edge Functions, webhook, web page")
     run_id = start_workflow(gh, repo, "bootstrap.yml")
     if not wait_for_run(gh, repo, run_id):
         die("bootstrap failed. Open the link above, read the failing step, fix it, then run this script again.")
 
-    say("4/4", "Checking")
+    if args.restart_worker:
+        say(f"4/{total}", "Restarting the worker with the new code")
+        restart_worker(gh, repo)
+
+    say(f"{total}/{total}", "Checking")
     owner, _, name = repo.partition("/")
     results = []
     project_ref = read_env_file().get("SUPABASE_PROJECT_REF", "")

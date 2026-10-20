@@ -1,9 +1,10 @@
-"""Handles one queue message at a time: channel pages and file deliveries.
+"""Handles one queue message at a time: channel pages, message lookups and file deliveries.
 
 Safety rules enforced here:
 * every state change is a compare-and-set in the database;
 * a job whose previous attempt reached "uploading" is marked ambiguous and is never resent automatically;
-* retries only happen for failures where the file was provably not delivered.
+* retries only happen for failures where the file was provably not delivered;
+* a lookup never starts a download. It only shows the card, and the file waits for the user's Accept.
 """
 
 from __future__ import annotations
@@ -13,18 +14,27 @@ import logging
 import os
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from typing import Any
 
 from .bale_client import BaleClient
+from .card import DOWNLOAD_QUESTION, build_caption, card_input, confirm_keyboard
 from .config import Settings
 from .errors import AppError
 from .message_mapper import RawMessage, to_row
-from .policy import backoff_seconds, sanitize_filename
-from .queue_ops import JOB_QUEUE, PAGE_QUEUE, QueueOps
-from .store import JOB_TABLE, PAGE_TABLE, Store
+from .policy import AWAITING_STATE, MAX_ACTIVE_JOBS, RUNNABLE_JOB_STATES, backoff_seconds, sanitize_filename
+from .queue_ops import JOB_QUEUE, LOOKUP_QUEUE, PAGE_QUEUE, QueueOps
+from .store import JOB_TABLE, LOOKUP_TABLE, PAGE_TABLE, Store
 
 log = logging.getLogger(__name__)
 _CAPTION_LIMIT = 1024
+
+_LOOKUP_REPLIES = {
+    "CHANNEL_NOT_FOUND": "کانالی با این نام پیدا نشد.",
+    "CHANNEL_ACCESS_DENIED": "این کانال عمومی نیست، پس پیام آن را نمی‌توان خواند.",
+    "MESSAGE_NOT_FOUND": "پیامی با این شناسه در کانال پیدا نشد.",
+}
+_LOOKUP_DEFAULT_REPLY = "اطلاعات این پیام گرفته نشد. کمی بعد دوباره امتحان کنید."
 
 
 class _Conflict(Exception):
@@ -108,12 +118,95 @@ class Pipeline:
         if self.store.cas(PAGE_TABLE, req, "failed", error_code=exc.code):
             self.queue.delete(PAGE_QUEUE, msg_id)
 
+    # ------------------------------------------------------------- message lookups
+    async def handle_lookup(self, msg: dict[str, Any]) -> None:
+        """A Telegram link typed in the bot chat: fetch the message and send its card."""
+        msg_id = msg["msg_id"]
+        lookup_id = (msg.get("message") or {}).get("lookup_id")
+        lookup = self.store.get_lookup(lookup_id) if lookup_id else None
+        if lookup is None or lookup["status"] in ("succeeded", "failed"):
+            self.queue.delete(LOOKUP_QUEUE, msg_id)
+            return
+        if not self.store.cas(LOOKUP_TABLE, lookup, "processing", attempts=lookup["attempts"] + 1):
+            return
+        try:
+            await self._answer_lookup(lookup)
+            self.store.cas(LOOKUP_TABLE, lookup, "succeeded", error_code=None)
+            self.queue.delete(LOOKUP_QUEUE, msg_id)
+        except AppError as exc:
+            self._fail_lookup(lookup, msg_id, exc)
+        except Exception as exc:  # noqa: BLE001 - unknown failures use the retry budget
+            log.error("lookup failed unexpectedly (%s)", type(exc).__name__)
+            self._fail_lookup(lookup, msg_id, AppError("INTERNAL_ERROR", retryable=True))
+
+    async def _answer_lookup(self, lookup: dict[str, Any]) -> None:
+        chat_id = self._chat_id(lookup["user_id"])
+        info = await self.source.resolve(lookup["username"])
+        channel = self.store.upsert_channel(info["telegram_peer_id"], info["username"], info["title"])
+        raw = await self.source.fetch_message(channel, lookup["message_id"])
+        if raw is None:
+            raise AppError("MESSAGE_NOT_FOUND")
+        # Cache the message, so the Mini App shows it too.
+        self.store.upsert_messages([to_row(raw, channel["id"])])
+
+        job = self._job_for_card(lookup["user_id"], channel["id"], raw) if self._deliverable(raw) else None
+        caption = build_caption(card_input(channel, raw), DOWNLOAD_QUESTION if job else None)
+        markup = confirm_keyboard(job["id"]) if job else None
+        sent = await asyncio.to_thread(self._send_card, chat_id, caption, raw.thumb, markup)
+        if job is not None and sent is not None:
+            self.store.set_job_confirm_message(job["id"], sent)
+
+    def _deliverable(self, raw: RawMessage) -> bool:
+        if raw.media_kind in (None, "unknown"):
+            return False
+        return not (raw.size_bytes and raw.size_bytes > self.settings.max_download_size_bytes)
+
+    def _job_for_card(self, user_id: str, channel_id: str, raw: RawMessage) -> dict[str, Any] | None:
+        """The awaiting job behind the card's buttons. None means the card is shown without buttons,
+        because the file is already being handled or the user has too many downloads at once."""
+        live = self.store.live_jobs(user_id, datetime.now(timezone.utc))
+        same = [job for job in live if job["channel_id"] == channel_id and job["message_id"] == raw.id]
+        for job in same:
+            if job["status"] == AWAITING_STATE:
+                return job
+        if same or len(live) >= MAX_ACTIVE_JOBS:
+            return None
+        return self.store.insert_job(
+            {"user_id": user_id, "channel_id": channel_id, "message_id": raw.id, "status": AWAITING_STATE}
+        )
+
+    def _send_card(self, chat_id: str, caption: str, thumb: bytes | None, markup: dict | None) -> str | None:
+        if thumb:
+            try:
+                return self.bale.send_photo(chat_id, thumb, caption, markup)
+            except AppError as exc:
+                log.warning("card photo refused (%s); sending the text card", exc.code)
+        return self.bale.send_message(chat_id, caption, markup)
+
+    def _fail_lookup(self, lookup: dict[str, Any], msg_id: int, exc: AppError) -> None:
+        if exc.retryable and lookup["attempts"] < self.settings.max_attempts:
+            if self.store.cas(LOOKUP_TABLE, lookup, "queued", error_code=exc.code):
+                delay = exc.retry_after or backoff_seconds(lookup["attempts"])
+                self.queue.set_visibility(LOOKUP_QUEUE, msg_id, delay)
+            return
+        if self.store.cas(LOOKUP_TABLE, lookup, "failed", error_code=exc.code):
+            self.queue.delete(LOOKUP_QUEUE, msg_id)
+            self._reply_lookup_failure(lookup, exc.code)
+
+    def _reply_lookup_failure(self, lookup: dict[str, Any], code: str) -> None:
+        text = _LOOKUP_REPLIES.get(code, _LOOKUP_DEFAULT_REPLY)
+        try:
+            self.bale.send_message(self._chat_id(lookup["user_id"]), text)
+        except Exception as exc:  # noqa: BLE001 - the reply is a courtesy; the lookup is already settled
+            log.warning("could not send the lookup failure reply (%s)", type(exc).__name__)
+
     # --------------------------------------------------------------- file delivery
     async def handle_job(self, msg: dict[str, Any]) -> None:
         msg_id = msg["msg_id"]
         job_id = (msg.get("message") or {}).get("job_id")
         job = self.store.get_job(job_id) if job_id else None
-        if job is None or job["status"] in ("succeeded", "failed", "ambiguous"):
+        if job is None or job["status"] not in RUNNABLE_JOB_STATES:
+            # Finished, declined, or still waiting for the user's Accept: nothing to do with this message.
             self.queue.delete(JOB_QUEUE, msg_id)
             return
         if job["status"] == "uploading":
@@ -145,11 +238,15 @@ class Pipeline:
         if not self.store.cas(JOB_TABLE, job, status, **fields):
             raise _Conflict()
 
-    async def _deliver(self, job: dict[str, Any]) -> None:
-        user = self.store.get_user(job["user_id"])
+    def _chat_id(self, user_id: str) -> str:
+        user = self.store.get_user(user_id)
         chat_id = user.get("bale_chat_id") if user else None
         if not chat_id:
             raise AppError("BALE_CHAT_REQUIRED", "user has not started the bot")
+        return str(chat_id)
+
+    async def _deliver(self, job: dict[str, Any]) -> None:
+        chat_id = self._chat_id(job["user_id"])
         channel = self.store.get_channel(job["channel_id"])
         if channel is None:
             raise AppError("CHANNEL_NOT_FOUND")

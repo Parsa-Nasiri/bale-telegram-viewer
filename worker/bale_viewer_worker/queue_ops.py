@@ -12,6 +12,7 @@ from .supabase_rest import SupabaseRest
 
 PAGE_QUEUE = "page_requests_q"
 JOB_QUEUE = "download_jobs_q"
+LOOKUP_QUEUE = "lookup_requests_q"
 
 
 class QueueOps:

@@ -6,6 +6,7 @@ import type { ApiConfig } from "../_shared/config.ts";
 import type { Db } from "../_shared/rest.ts";
 import { signToken } from "../_shared/token.ts";
 import { FakeDb, type Row } from "./fake-db.ts";
+import { FakeBale } from "./fake-bale.ts";
 
 const NOW = 1_800_000_000;
 const ORIGIN = "https://pages.example";
@@ -55,8 +56,8 @@ function seed(overrides: Record<string, Row[]> = {}): FakeDb {
   });
 }
 
-function depsFor(db: FakeDb): ApiDeps {
-  return { config, db: db as unknown as Db, now: () => NOW };
+function depsFor(db: FakeDb, bale: FakeBale = new FakeBale()): ApiDeps {
+  return { config, db: db as unknown as Db, bale, now: () => NOW };
 }
 
 async function tokenFor(uid: string): Promise<string> {
@@ -208,6 +209,23 @@ describe("GET /channels/:id/messages", () => {
     assert.equal(db.inserts.length, 0);
   });
 
+  it("includes a thumbnail only when the cached message has a valid image", async () => {
+    const thumb = "data:image/jpeg;base64,AAAA";
+    const db = seed({
+      messages: [
+        message(9, { media_type: "photo", metadata: { available: true, size_bytes: 10, thumb } }),
+        message(10, { media_type: "document", metadata: { available: true, thumb: "https://example.com/x.jpg" } }),
+      ],
+    });
+    const body = await (
+      await call(depsFor(db), "GET", `/channels/${CHANNEL_ID}/messages?limit=5`, { token: await tokenFor(USER_ID) })
+    ).json();
+    assert.deepEqual(
+      body.items.map((item: { thumb: string | null }) => item.thumb),
+      [thumb, null],
+    );
+  });
+
   it("rejects a malformed channel id", async () => {
     const res = await call(depsFor(seed()), "GET", "/channels/not-a-uuid/messages", {
       token: await tokenFor(USER_ID),
@@ -289,21 +307,100 @@ describe("POST /downloads", () => {
     assert.equal((await res.json()).error.code, "BALE_CHAT_REQUIRED");
   });
 
-  it("queues a job and hands its id to the worker queue", async () => {
-    const db = seed({ users: [{ id: USER_ID, bale_user_id: "42", bale_chat_id: "42" }] });
-    const res = await call(depsFor(db), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+  const linkedUsers = [{ id: USER_ID, bale_user_id: "42", bale_chat_id: "42" }];
+
+  it("asks for confirmation in the bot chat and queues nothing until the user accepts", async () => {
+    const db = seed({ users: linkedUsers });
+    const bale = new FakeBale();
+    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
     assert.equal(res.status, 202);
     const created = await res.json();
-    assert.equal(created.status, "queued");
+    assert.equal(created.status, "awaiting_confirmation");
     assert.equal(created.reused, false);
 
     const job = db.inserts.find((insert) => insert.table === "download_jobs");
     assert.equal(job?.row.message_id, 10);
-    assert.equal(job?.row.status, "queued");
-    assert.deepEqual(db.rpcs[0], {
-      name: "pgmq_send",
-      args: { p_queue: "download_jobs_q", p_msg: { job_id: created.jobId } },
+    assert.equal(job?.row.status, "awaiting_confirmation");
+    assert.equal(db.rpcs.length, 0, "nothing is queued before Accept");
+
+    assert.equal(bale.sent.length, 1);
+    assert.equal(bale.sent[0].kind, "message");
+    assert.equal(bale.sent[0].chatId, 42);
+    assert.match(bale.sent[0].text, /نام فایل: a\.pdf/);
+    assert.deepEqual(bale.sent[0].replyMarkup, {
+      inline_keyboard: [
+        [
+          { text: "تأیید دانلود", callback_data: `dl:y:${created.jobId}` },
+          { text: "لغو", callback_data: `dl:n:${created.jobId}` },
+        ],
+      ],
     });
+    const stored = db.updates.find((update) => "confirm_message_id" in update.values);
+    assert.equal(stored?.values.confirm_message_id, String(bale.sent[0].messageId));
+  });
+
+  it("sends the card as a photo when the message has a thumbnail", async () => {
+    const thumb = `data:image/jpeg;base64,${Buffer.from([1, 2, 3]).toString("base64")}`;
+    const db = seed({
+      users: linkedUsers,
+      messages: [
+        message(10, {
+          media_type: "document",
+          metadata: { available: true, size_bytes: 1000, file_name: "a.pdf", thumb },
+        }),
+      ],
+    });
+    const bale = new FakeBale();
+    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+    assert.equal(res.status, 202);
+    assert.equal(bale.sent[0].kind, "photo");
+    assert.equal(bale.sent[0].photoBytes, 3);
+  });
+
+  it("falls back to a text card when Bale refuses the photo", async () => {
+    const thumb = `data:image/jpeg;base64,${Buffer.from([1, 2, 3]).toString("base64")}`;
+    const db = seed({
+      users: linkedUsers,
+      messages: [
+        message(10, { media_type: "document", metadata: { available: true, size_bytes: 1000, thumb } }),
+      ],
+    });
+    const bale = new FakeBale();
+    bale.failPhoto = true;
+    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+    assert.equal(res.status, 202);
+    assert.equal(bale.sent[0].kind, "message");
+  });
+
+  it("marks the job failed and says so when Bale refuses the card", async () => {
+    const db = seed({ users: linkedUsers });
+    const bale = new FakeBale();
+    bale.failMessage = true;
+    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+    assert.equal(res.status, 502);
+    assert.equal((await res.json()).error.code, "BALE_SEND_FAILED");
+    assert.equal(db.tables.download_jobs[0].status, "failed");
+    assert.equal(db.tables.download_jobs[0].error_code, "CONFIRM_SEND_FAILED");
+    assert.equal(db.rpcs.length, 0);
+  });
+
+  it("an awaiting card older than the confirmation window does not block a new request", async () => {
+    const db = seed({
+      users: linkedUsers,
+      download_jobs: [
+        {
+          id: "old-job",
+          user_id: USER_ID,
+          channel_id: CHANNEL_ID,
+          message_id: 10,
+          status: "awaiting_confirmation",
+          created_at: new Date((NOW - 3600) * 1000).toISOString(),
+        },
+      ],
+    });
+    const created = await (await call(depsFor(db), "POST", "/downloads", { token: await tokenFor(USER_ID), body })).json();
+    assert.equal(created.reused, false);
+    assert.notEqual(created.jobId, "old-job");
   });
 
   it("returns the existing job when the same file is requested again", async () => {

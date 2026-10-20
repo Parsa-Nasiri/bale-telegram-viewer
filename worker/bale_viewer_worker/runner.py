@@ -3,7 +3,10 @@
 The loop stops claiming new work at `drain_after` and exits by `hard_stop`.
 GitHub Actions kills any job at 6 hours, so `hard_stop` must stay below that.
 A message that is still in flight when the process exits becomes visible again
-after its visibility timeout, and the job state machine handles the retry.
+after its visibility timeout, and the state machines handle the retry.
+
+Queue priority: channel pages first (the reader is waiting for them), then message
+lookups (a person typed a link and is waiting), then file deliveries.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from typing import Any
 
 from .config import Settings
 from .pipeline import Pipeline
-from .queue_ops import JOB_QUEUE, PAGE_QUEUE, QueueOps
+from .queue_ops import JOB_QUEUE, LOOKUP_QUEUE, PAGE_QUEUE, QueueOps
 from .store import Store
 from .supabase_rest import StoreError
 
@@ -68,6 +71,9 @@ class Runner:
         page = self.queue.read_one(PAGE_QUEUE, vis)
         if page is not None:
             return "page", page
+        lookup = self.queue.read_one(LOOKUP_QUEUE, vis)
+        if lookup is not None:
+            return "lookup", lookup
         job = self.queue.read_one(JOB_QUEUE, vis)
         if job is not None:
             return "job", job
@@ -97,6 +103,8 @@ class Runner:
                         continue
                     if kind == "page":
                         await self.pipeline.handle_page(item)
+                    elif kind == "lookup":
+                        await self.pipeline.handle_lookup(item)
                     else:
                         await self.pipeline.handle_job(item)
                 except StoreError as exc:

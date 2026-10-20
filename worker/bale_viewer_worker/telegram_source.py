@@ -11,6 +11,7 @@ without it.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from .errors import AppError
@@ -86,6 +87,16 @@ class TelegramSource:
         except ChannelPrivateError as exc:
             raise AppError("CHANNEL_ACCESS_DENIED") from exc
 
+    async def _with_thumb(self, message: Any, raw: RawMessage) -> RawMessage:
+        """Attaches the smallest thumbnail of a media message. Best effort: the thumbnail is optional."""
+        if raw.media_kind in (None, "unknown"):
+            return raw
+        try:
+            data = await self._client.download_media(message, file=bytes, thumb=0)
+        except Exception:  # noqa: BLE001 - a missing thumbnail must never stop the message itself
+            return raw
+        return replace(raw, thumb=data) if isinstance(data, bytes) and data else raw
+
     async def resolve(self, username: str) -> dict:
         """Return {telegram_peer_id, username, title} for a public channel username."""
         from telethon.errors import (
@@ -115,12 +126,18 @@ class TelegramSource:
     async def fetch_page(self, channel: dict, before_id: int | None, limit: int) -> list[RawMessage]:
         entity = await self._entity(channel)
         messages = await self._client.get_messages(entity, limit=limit, offset_id=before_id or 0)
-        return [to_raw(m) for m in messages if m is not None and getattr(m, "id", None)]
+        return [
+            await self._with_thumb(m, to_raw(m))
+            for m in messages
+            if m is not None and getattr(m, "id", None)
+        ]
 
     async def fetch_message(self, channel: dict, message_id: int) -> RawMessage | None:
         entity = await self._entity(channel)
         message = await self._client.get_messages(entity, ids=message_id)
-        return None if message is None else to_raw(message)
+        if message is None:
+            return None
+        return await self._with_thumb(message, to_raw(message))
 
     async def download(self, channel: dict, message_id: int, dest_path: str) -> str:
         from telethon.errors import FloodWaitError

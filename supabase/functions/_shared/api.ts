@@ -1,37 +1,44 @@
 // HTTP routes for the Mini App. Routes validate input and check the caller's app token.
-// They never call Telegram or Bale. They read the cache, or enqueue work that the worker picks up.
+// They read the cache, or queue work for the worker. A download is confirmed in the bot chat before it is queued.
 
+import { type BaleApi, sendCard } from "./bale.ts";
 import type { ApiConfig } from "./config.ts";
+import { type CardInput, buildCaption, cardInputFrom, confirmKeyboard, DOWNLOAD_QUESTION } from "./card.ts";
 import { corsHeaders, errorResponse, HttpError, jsonResponse, readJson } from "./http.ts";
 import { verifyInitData } from "./initdata.ts";
 import {
   buildPageMeta,
-  clampLimit,
   type CachedMessage,
+  clampLimit,
   downloadBlocker,
+  isLiveJob,
   isUuid,
-  MAX_ACTIVE_JOBS,
+  LIVE_JOB_STATES,
   MAX_PAGE_REQUESTS_PER_HOUR,
   normalizeUsername,
   parseCursor,
   segmentsAfter,
+  validThumb,
 } from "./logic.ts";
+import { enqueue, PAGE_QUEUE } from "./queue.ts";
 import type { Db } from "./rest.ts";
 import { signToken, verifyToken } from "./token.ts";
 
 export interface ApiDeps {
   config: ApiConfig;
   db: Db;
+  bale: BaleApi;
   now: () => number; // unix seconds
 }
 
-const PAGE_QUEUE = "page_requests_q";
-const JOB_QUEUE = "download_jobs_q";
-const ACTIVE_JOB_STATES = ["queued", "processing", "downloading", "uploading"];
-const PENDING_REQUEST_STATES = ["queued", "processing"];
-const MAX_INIT_DATA_LENGTH = 4096;
 const CHANNEL_COLUMNS = "id,username,title";
 const MESSAGE_COLUMNS = "message_id,date,text,media_type,group_id,metadata";
+const MESSAGE_CARD_COLUMNS = "message_id,date,text,media_type,metadata";
+const JOB_COLUMNS = "id,status,attempts,error_code,channel_id,message_id,updated_at,created_at";
+const PENDING_REQUEST_STATES = ["queued", "processing"];
+const MAX_INIT_DATA_LENGTH = 4096;
+// Enough to see every live job of one user (the limit is 5), with room for stale awaiting ones.
+const LIVE_JOB_QUERY_LIMIT = 50;
 
 interface UserRow {
   id: string;
@@ -50,6 +57,7 @@ interface MessageMetadata {
   mime_type?: string | null;
   size_bytes?: number | null;
   available?: boolean;
+  thumb?: unknown;
 }
 
 interface MessageRow {
@@ -81,6 +89,7 @@ interface JobRow {
   channel_id: string;
   message_id: number;
   updated_at: string;
+  created_at?: string | null;
 }
 
 type Cors = Record<string, string>;
@@ -241,6 +250,10 @@ async function listMessages(
   );
 }
 
+/**
+ * Starts a download. The job waits in `awaiting_confirmation` and the bot sends the user a card with Accept and
+ * Decline. Nothing is queued for the worker until the user taps Accept (see webhook.ts).
+ */
 async function createDownload(req: Request, deps: ApiDeps, cors: Cors): Promise<Response> {
   const uid = await requireUser(req, deps);
   const body = await readJson(req);
@@ -251,48 +264,75 @@ async function createDownload(req: Request, deps: ApiDeps, cors: Cors): Promise<
     throw new HttpError(400, "INVALID_MESSAGE_ID");
   }
 
+  const now = deps.now();
   const user = await deps.db.selectOne<UserRow>("users", { select: "id,bale_chat_id", id: `eq.${uid}` });
   if (!user) throw new HttpError(401, "UNAUTHORIZED");
 
-  const active = await deps.db.select<JobRow>("download_jobs", {
-    select: "id,status,attempts,error_code,channel_id,message_id,updated_at",
-    user_id: `eq.${uid}`,
-    status: `in.(${ACTIVE_JOB_STATES.join(",")})`,
-    limit: String(MAX_ACTIVE_JOBS + 1),
-  });
+  const live = (
+    await deps.db.select<JobRow>("download_jobs", {
+      select: JOB_COLUMNS,
+      user_id: `eq.${uid}`,
+      status: `in.(${LIVE_JOB_STATES.join(",")})`,
+      limit: String(LIVE_JOB_QUERY_LIMIT),
+    })
+  ).filter((job) => isLiveJob(job, now));
 
-  // The same file requested twice returns the existing job instead of a second delivery.
-  const same = active.find((job) => job.channel_id === channelId && job.message_id === messageId);
+  // The same file requested twice returns the existing job instead of a second card.
+  const same = live.find((job) => job.channel_id === channelId && job.message_id === messageId);
   if (same) return jsonResponse({ jobId: same.id, status: same.status, reused: true }, 202, cors);
 
   const message = await deps.db.selectOne<CachedMessage>("messages", {
-    select: "message_id,media_type,metadata",
+    select: MESSAGE_CARD_COLUMNS,
     channel_id: `eq.${channelId}`,
     message_id: `eq.${messageId}`,
   });
   const blocker = downloadBlocker({
     hasBaleChat: user.bale_chat_id !== null,
     message,
-    activeJobs: active.length,
+    activeJobs: live.length,
     maxBytes: deps.config.maxDownloadBytes,
   });
   if (blocker) throw new HttpError(blocker.status, blocker.code);
+  if (!message || user.bale_chat_id === null) throw new HttpError(500, "INTERNAL_ERROR");
+
+  const channel = await deps.db.selectOne<ChannelRow>("channels", { select: CHANNEL_COLUMNS, id: `eq.${channelId}` });
+  if (!channel) throw new HttpError(404, "CHANNEL_NOT_FOUND");
 
   const job = await deps.db.insertOne<JobRow>("download_jobs", {
     user_id: uid,
     channel_id: channelId,
     message_id: messageId,
-    status: "queued",
+    status: "awaiting_confirmation",
   });
-  await enqueue(deps, JOB_QUEUE, "download_jobs", job.id, { job_id: job.id });
-  return jsonResponse({ jobId: job.id, status: "queued", reused: false }, 202, cors);
+
+  const card: CardInput = cardInputFrom(channel, message);
+  let confirmMessageId: number | null;
+  try {
+    confirmMessageId = await sendCard(deps.bale, {
+      chatId: Number(user.bale_chat_id),
+      caption: buildCaption(card, DOWNLOAD_QUESTION),
+      replyMarkup: confirmKeyboard(job.id),
+      thumb: validThumb(message.metadata?.thumb),
+    });
+  } catch {
+    await deps.db.update(
+      "download_jobs",
+      { id: `eq.${job.id}` },
+      { status: "failed", error_code: "CONFIRM_SEND_FAILED" },
+    );
+    throw new HttpError(502, "BALE_SEND_FAILED", "could not send the confirmation to the bot chat");
+  }
+  if (confirmMessageId !== null) {
+    await deps.db.update("download_jobs", { id: `eq.${job.id}` }, { confirm_message_id: String(confirmMessageId) });
+  }
+  return jsonResponse({ jobId: job.id, status: "awaiting_confirmation", reused: false }, 202, cors);
 }
 
 async function getDownload(req: Request, id: string | undefined, deps: ApiDeps, cors: Cors): Promise<Response> {
   const uid = await requireUser(req, deps);
   if (!isUuid(id)) throw new HttpError(400, "INVALID_ID");
   const row = await deps.db.selectOne<JobRow>("download_jobs", {
-    select: "id,status,attempts,error_code,channel_id,message_id,updated_at",
+    select: JOB_COLUMNS,
     id: `eq.${id}`,
     user_id: `eq.${uid}`,
   });
@@ -355,20 +395,8 @@ async function submitPageRequest(deps: ApiDeps, uid: string, request: PageReques
           status: "queued",
         };
   const created = await deps.db.insertOne<RequestRow>("page_requests", row);
-  await enqueue(deps, PAGE_QUEUE, "page_requests", created.id, { request_id: created.id });
+  await enqueue(deps.db, PAGE_QUEUE, "page_requests", created.id, { request_id: created.id });
   return created.id;
-}
-
-/** Sends the row id to the queue, then records the queue message id on the row. Status stays in the row. */
-async function enqueue(
-  deps: ApiDeps,
-  queue: string,
-  table: "page_requests" | "download_jobs",
-  rowId: string,
-  payload: Record<string, string>,
-): Promise<void> {
-  const msgId = await deps.db.rpc<number>("pgmq_send", { p_queue: queue, p_msg: payload });
-  await deps.db.update(table, { id: `eq.${rowId}` }, { queue_msg_id: msgId });
 }
 
 function toChannel(row: ChannelRow) {
@@ -387,6 +415,7 @@ function toMessage(row: MessageRow) {
     fileName: meta.file_name ?? null,
     mimeType: meta.mime_type ?? null,
     sizeBytes: meta.size_bytes ?? null,
+    thumb: validThumb(meta.thumb),
     downloadable: meta.available === true && row.media_type !== null,
   };
 }

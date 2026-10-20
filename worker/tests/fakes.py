@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from bale_viewer_worker.errors import AppError
 from bale_viewer_worker.message_mapper import RawMessage
-from bale_viewer_worker.policy import JOB_TRANSITIONS, PAGE_TRANSITIONS, can_transition
-from bale_viewer_worker.store import JOB_TABLE, PAGE_TABLE
+from bale_viewer_worker.policy import (
+    ACTIVE_JOB_STATES,
+    AWAITING_STATE,
+    JOB_TRANSITIONS,
+    LOOKUP_TRANSITIONS,
+    PAGE_TRANSITIONS,
+    can_transition,
+    is_live_job,
+)
+from bale_viewer_worker.store import JOB_TABLE, LOOKUP_TABLE, PAGE_TABLE
 from bale_viewer_worker.transport import HttpResponse, TransportError
+
+_TRANSITIONS = {JOB_TABLE: JOB_TRANSITIONS, PAGE_TABLE: PAGE_TRANSITIONS, LOOKUP_TABLE: LOOKUP_TRANSITIONS}
 
 
 class FakeTransport:
@@ -36,13 +47,16 @@ def ok_json(payload: dict, status: int = 200) -> HttpResponse:
 
 class FakeStore:
     def __init__(self) -> None:
-        self.tables: dict[str, dict[str, dict[str, Any]]] = {JOB_TABLE: {}, PAGE_TABLE: {}}
+        self.tables: dict[str, dict[str, dict[str, Any]]] = {JOB_TABLE: {}, PAGE_TABLE: {}, LOOKUP_TABLE: {}}
         self.users: dict[str, dict[str, Any]] = {}
         self.channels: dict[str, dict[str, Any]] = {}
         self.messages: list[dict[str, Any]] = []
         self.sync: dict[str, dict[str, Any]] = {}
         self.kv: dict[str, Any] = {}
         self.heartbeats: list[tuple[str, str, str]] = []
+        self.inserted_jobs: list[dict[str, Any]] = []
+        self.confirm_messages: dict[str, str] = {}
+        self._seq = 0
 
     # --- helpers used by tests
     def add_page(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -55,17 +69,49 @@ class FakeStore:
         self.tables[JOB_TABLE][row["id"]] = row
         return row
 
+    def add_lookup(self, row: dict[str, Any]) -> dict[str, Any]:
+        row = {"status": "queued", "attempts": 0, "error_code": None, **row}
+        self.tables[LOOKUP_TABLE][row["id"]] = row
+        return row
+
     # --- store interface
     def get_page_request(self, request_id: str) -> dict | None:
         row = self.tables[PAGE_TABLE].get(request_id)
+        return dict(row) if row else None
+
+    def get_lookup(self, lookup_id: str) -> dict | None:
+        row = self.tables[LOOKUP_TABLE].get(lookup_id)
         return dict(row) if row else None
 
     def get_job(self, job_id: str) -> dict | None:
         row = self.tables[JOB_TABLE].get(job_id)
         return dict(row) if row else None
 
+    def insert_job(self, row: dict[str, Any]) -> dict[str, Any]:
+        self._seq += 1
+        created = {
+            "id": f"new-job-{self._seq}",
+            "status": "queued",
+            "attempts": 0,
+            "error_code": None,
+            "bale_message_id": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **row,
+        }
+        self.tables[JOB_TABLE][created["id"]] = created
+        self.inserted_jobs.append(created)
+        return dict(created)
+
+    def set_job_confirm_message(self, job_id: str, message_id: str) -> None:
+        self.confirm_messages[job_id] = message_id
+        self.tables[JOB_TABLE][job_id]["confirm_message_id"] = message_id
+
+    def live_jobs(self, user_id: str, now: datetime) -> list[dict]:
+        rows = [row for row in self.tables[JOB_TABLE].values() if row.get("user_id") == user_id]
+        return [dict(row) for row in rows if is_live_job(row["status"], row.get("created_at"), now)]
+
     def cas(self, table: str, row: dict, to_status: str, **fields: Any) -> bool:
-        transitions = JOB_TRANSITIONS if table == JOB_TABLE else PAGE_TRANSITIONS
+        transitions = _TRANSITIONS.get(table, PAGE_TRANSITIONS)
         stored = self.tables[table][row["id"]]
         if stored["status"] != row["status"]:
             return False
@@ -117,6 +163,8 @@ class FakeStore:
 
 
 class FakeQueue:
+    """Single list of messages. Queue names are ignored unless a test subclasses this."""
+
     def __init__(self, messages: list[dict] | None = None) -> None:
         self.pending = list(messages or [])
         self.deleted: list[int] = []
@@ -151,8 +199,10 @@ class FakeSource:
         self.download_error: Exception | None = None
         self.fetch_calls: list[tuple[int | None, int]] = []
         self.download_calls = 0
+        self.resolve_calls: list[str] = []
 
     async def resolve(self, username: str) -> dict:
+        self.resolve_calls.append(username)
         if isinstance(self.resolve_result, Exception):
             raise self.resolve_result
         return dict(self.resolve_result)
@@ -181,9 +231,15 @@ class FakeSource:
 
 
 class FakeBale:
+    """Records every send. `result` is the Bale message id, or an exception to raise."""
+
     def __init__(self, result: str | Exception = "555") -> None:
         self.result = result
         self.sent: list[dict[str, Any]] = []
+        self.cards: list[dict[str, Any]] = []
+        self.photo_error: Exception | None = None
+        self.message_error: Exception | None = None
+        self.card_id = 900
 
     def send_document(self, chat_id: str, path: str, filename: str, mime_type: str, caption: str) -> str:
         self.sent.append(
@@ -194,8 +250,23 @@ class FakeBale:
             raise self.result
         return self.result
 
+    def send_photo(self, chat_id: str, photo: bytes, caption: str, reply_markup: dict | None = None) -> str:
+        if self.photo_error is not None:
+            raise self.photo_error
+        self.card_id += 1
+        self.cards.append({"kind": "photo", "chat_id": chat_id, "photo": photo, "caption": caption,
+                           "reply_markup": reply_markup})
+        return str(self.card_id)
 
-def photo(message_id: int = 10, size: int | None = 1000) -> RawMessage:
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> str:
+        if self.message_error is not None:
+            raise self.message_error
+        self.card_id += 1
+        self.cards.append({"kind": "message", "chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return str(self.card_id)
+
+
+def photo(message_id: int = 10, size: int | None = 1000, thumb: bytes | None = None) -> RawMessage:
     from datetime import datetime, timezone
 
     return RawMessage(
@@ -208,7 +279,20 @@ def photo(message_id: int = 10, size: int | None = 1000) -> RawMessage:
         file_name=None,
         mime_type="image/jpeg",
         size_bytes=size,
+        thumb=thumb,
     )
 
 
-__all__ = ["AppError", "FakeBale", "FakeQueue", "FakeSource", "FakeStore", "FakeTransport", "TransportError", "ok_json", "photo"]
+__all__ = [
+    "ACTIVE_JOB_STATES",
+    "AWAITING_STATE",
+    "AppError",
+    "FakeBale",
+    "FakeQueue",
+    "FakeSource",
+    "FakeStore",
+    "FakeTransport",
+    "TransportError",
+    "ok_json",
+    "photo",
+]

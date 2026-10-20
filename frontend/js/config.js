@@ -7,5 +7,6 @@ export const CONFIG = Object.freeze({
   requestPollMs: 2000,
   requestPollAttempts: 30,
   downloadPollMs: 4000,
-  downloadPollAttempts: 60,
+  // A card waits up to 30 minutes for the user's answer in the bot chat, so polling goes on that long.
+  downloadPollAttempts: 450,
 });

@@ -9,6 +9,8 @@ export const MOCK_CHANNEL = Object.freeze({
   title: "کانال نمونه",
 });
 
+// A 1x1 PNG, so mock thumbnails exercise the same code path as real ones.
+const MOCK_THUMB = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 const BASE_TIME = Date.UTC(2026, 5, 1, 9, 0, 0);
 
 export function makeMockMessage(id) {
@@ -23,6 +25,7 @@ export function makeMockMessage(id) {
     fileName: kind === "document" ? `گزارش-${id}.pdf` : null,
     mimeType: kind === "document" ? "application/pdf" : kind === "photo" ? "image/jpeg" : null,
     sizeBytes: kind ? 90000 + id * 1200 : null,
+    thumb: kind ? MOCK_THUMB : null,
     downloadable: kind !== null,
   };
 }
@@ -65,13 +68,14 @@ export function createMockApi({ delayMs = 120, total = 240 } = {}) {
       };
     },
 
+    // The real API waits for the user's Accept in the bot chat. The mock only shows the first step of that.
     async createDownload(_channelId, messageId) {
       await wait();
       const message = messages.find((candidate) => candidate.id === messageId);
       if (!message || !message.downloadable) throw new ApiError(422, "MEDIA_UNAVAILABLE");
       const jobId = `mock-job-${++jobSequence}`;
       jobs.set(jobId, { polls: 0 });
-      return { jobId, status: "queued", reused: false };
+      return { jobId, status: "awaiting_confirmation", reused: false };
     },
 
     async getDownload(jobId) {

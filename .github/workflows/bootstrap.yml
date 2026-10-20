@@ -48,8 +48,10 @@ jobs:
         # `echo y` answers the CLI's confirmation prompt. Migrations already applied are skipped.
         run: echo y | supabase db push
 
-      - name: Store the Bale token for the Edge Functions
-        run: supabase secrets set "BALE_BOT_TOKEN=$BALE_BOT_TOKEN"
+      - name: Store the Bale token and the page address for the Edge Functions
+        # The page address is the GitHub Pages address of this repository. The bot's button opens it.
+        run: |
+          supabase secrets set "BALE_BOT_TOKEN=$BALE_BOT_TOKEN" "MINI_APP_URL=https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
 
       - name: Deploy the Edge Functions
         run: |

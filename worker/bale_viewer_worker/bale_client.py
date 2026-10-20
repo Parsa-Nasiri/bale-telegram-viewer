@@ -1,4 +1,4 @@
-"""Bale Bot API client (sendDocument, getMe).
+"""Bale Bot API client (sendDocument, sendPhoto, sendMessage, getMe).
 
 Base URL shape from the Bale Bot API docs: https://tapi.bale.ai/bot<token>/METHOD
 
@@ -7,6 +7,9 @@ Outcome classification for sendDocument:
 * HTTP 429 / 500 / 503                    -> BALE_SEND_FAILED, retryable
 * HTTP 502 / 504 / timeout / reset        -> BALE_SEND_AMBIGUOUS (may have been sent)
 * other 4xx                               -> BALE_SEND_FAILED, permanent
+
+sendPhoto and sendMessage carry only the info card, never a file, so a failed card is
+retried or replaced by a text card and is never treated as a delivery.
 """
 
 from __future__ import annotations
@@ -84,6 +87,35 @@ class BaleClient:
             if exc.kind == "not_sent":
                 raise AppError("BALE_SEND_FAILED", "not sent", retryable=True) from None
             raise AppError("BALE_SEND_AMBIGUOUS", "outcome unknown after upload started") from None
+        return _interpret_send(resp.status, _decode(resp.body))
+
+    def send_photo(self, chat_id: str, photo: bytes, caption: str, reply_markup: dict | None = None) -> str:
+        """Send a thumbnail with the card text and its buttons. Returns the Bale message id."""
+        fields = {"chat_id": chat_id, "caption": caption[:CAPTION_LIMIT]}
+        if reply_markup is not None:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        body, content_type = _multipart(fields, "photo", "thumb.jpg", "image/jpeg", photo)
+        return self._send_request("sendPhoto", body, content_type)
+
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> str:
+        """Send a text card with its buttons. Returns the Bale message id."""
+        payload: dict = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return self._send_request("sendMessage", body, "application/json; charset=utf-8")
+
+    def _send_request(self, method: str, body: bytes, content_type: str) -> str:
+        try:
+            resp = self._transport.request(
+                "POST",
+                self._url(method),
+                headers={"Content-Type": content_type},
+                body=body,
+                timeout=_SMALL_TIMEOUT,
+            )
+        except TransportError as exc:
+            raise AppError("BALE_SEND_FAILED", f"{method} {exc.kind}", retryable=True) from None
         return _interpret_send(resp.status, _decode(resp.body))
 
 
