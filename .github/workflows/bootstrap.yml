@@ -37,9 +37,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install the Supabase CLI
+        # Pinned. "latest" makes the action ask the GitHub API for the newest release, and shared runners often
+        # hit its rate limit ("rate limit exceeded"). Change this number to upgrade the CLI on purpose.
         uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.84.2
 
       - name: Link the Supabase project
         run: supabase link --project-ref "$SUPABASE_PROJECT_REF"
