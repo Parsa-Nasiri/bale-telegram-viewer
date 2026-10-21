@@ -59,6 +59,14 @@ test("listMessages omits the query string when no options are given", async () =
   assert.equal(calls[1].url, `${BASE}/channels/chan-1/messages`);
 });
 
+test("listMessages can ask for the saved messages only", async () => {
+  const { calls, fetchImpl } = recorder([{ body: { token: "t" } }, { body: { items: [] } }]);
+  const api = createApi({ baseUrl: BASE, fetchImpl });
+  await api.authenticate("init");
+  await api.listMessages("chan-1", { allowFetch: false, limit: 25 });
+  assert.equal(calls[1].url, `${BASE}/channels/chan-1/messages?limit=25&fetch=0`);
+});
+
 test("ids are URL-encoded in path segments", async () => {
   const { calls, fetchImpl } = recorder([{ body: { token: "t" } }, { body: {} }]);
   const api = createApi({ baseUrl: BASE, fetchImpl });

@@ -16,14 +16,14 @@ from bale_viewer_worker.card import (
 )
 from bale_viewer_worker.config import Settings
 from bale_viewer_worker.errors import AppError
-from bale_viewer_worker.message_mapper import RawMessage, thumb_data_url, to_row
+from bale_viewer_worker.message_mapper import RawMessage, to_row
 from bale_viewer_worker.pipeline import _LOOKUP_REPLIES, Pipeline
 from bale_viewer_worker.queue_ops import JOB_QUEUE, LOOKUP_QUEUE, PAGE_QUEUE
 from bale_viewer_worker.runner import Runner
 from bale_viewer_worker.store import JOB_TABLE, LOOKUP_TABLE
 from bale_viewer_worker.transport import HttpResponse
 
-from tests.fakes import FakeBale, FakeQueue, FakeSource, FakeStore, FakeTransport, ok_json, photo
+from tests.fakes import FakeBale, FakeQueue, FakeSource, FakeStore, FakeThumbs, FakeTransport, ok_json, photo
 
 JOB_ID = "44444444-4444-4444-8444-444444444444"
 JPEG = b"\xff\xd8\xff" + b"0" * 20
@@ -133,19 +133,11 @@ class CardTextTests(unittest.TestCase):
 
 
 class ThumbnailTests(unittest.TestCase):
-    def test_jpeg_and_png_thumbnails_become_data_urls(self):
-        self.assertTrue(thumb_data_url(JPEG).startswith("data:image/jpeg;base64,"))
-        self.assertTrue(thumb_data_url(b"\x89PNG\r\n\x1a\n" + b"0" * 10).startswith("data:image/png;base64,"))
-
-    def test_other_formats_and_oversized_images_are_dropped(self):
-        self.assertIsNone(thumb_data_url(b"RIFF0000WEBPVP8 0000"))
-        self.assertIsNone(thumb_data_url(None))
-        self.assertIsNone(thumb_data_url(b"\xff\xd8\xff" + b"x" * 40_000))
-
-    def test_thumbnail_is_stored_in_message_metadata_only_when_present(self):
-        with_thumb = to_row(photo(10, thumb=JPEG), "ch")
-        self.assertTrue(with_thumb["metadata"]["thumb"].startswith("data:image/jpeg"))
-        self.assertNotIn("thumb", to_row(photo(10), "ch")["metadata"])
+    def test_the_stored_path_is_recorded_in_message_metadata_only_when_present(self):
+        with_thumb = to_row(photo(10, thumb=JPEG), "ch", "ch/10.jpg")
+        self.assertEqual(with_thumb["metadata"]["thumb_path"], "ch/10.jpg")
+        self.assertNotIn("thumb", with_thumb["metadata"])
+        self.assertNotIn("thumb_path", to_row(photo(10, thumb=JPEG), "ch")["metadata"])
 
 
 class BaleCardClientTests(unittest.TestCase):
@@ -198,12 +190,20 @@ class LookupTests(unittest.TestCase):
         self.store.users["u1"] = {"id": "u1", "bale_chat_id": "5001", "display_name": "A"}
         self.store.add_lookup({"id": "L1", "user_id": "u1", "username": "chan", "message_id": 10})
         self.source.message = photo(10, thumb=JPEG)
+        self.thumbs = FakeThumbs()
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _pipeline(self) -> Pipeline:
-        return Pipeline(settings=self.settings, store=self.store, queue=self.queue, source=self.source, bale=self.bale)
+        return Pipeline(
+            settings=self.settings,
+            store=self.store,
+            queue=self.queue,
+            source=self.source,
+            bale=self.bale,
+            thumbs=self.thumbs,
+        )
 
     def _run(self, lookup_id: str = "L1", msg_id: int = 3) -> None:
         asyncio.run(self._pipeline().handle_lookup({"msg_id": msg_id, "message": {"lookup_id": lookup_id}}))
@@ -223,7 +223,8 @@ class LookupTests(unittest.TestCase):
         self.assertTrue(card["caption"].endswith(DOWNLOAD_QUESTION))
         self.assertEqual(self.store.confirm_messages[job["id"]], "901")
         self.assertEqual(self.source.download_calls, 0)
-        self.assertTrue(self.store.messages[-1]["metadata"]["thumb"].startswith("data:image/jpeg"))
+        self.assertTrue(self.store.messages[-1]["metadata"]["thumb_path"].endswith("/10.jpg"))
+        self.assertTrue(self.thumbs.puts[0][0].endswith("/10.jpg"))
         self.assertEqual(self.queue.deleted, [3])
 
     def test_text_message_gets_a_card_without_buttons(self):

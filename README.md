@@ -146,8 +146,16 @@ user answers, then `queued` (accepted) or `declined`.
 has the two buttons. The lookup also caches the message, so it appears in the Mini App. Each user can make 30
 lookups per hour.
 
-**Thumbnails.** The smallest Telegram thumbnail of a media message is stored with the message, as a JPEG or PNG
-data URL of about 29 KB at most. Messages without a usable thumbnail show the file box only.
+**Fresh channels.** Every time a channel is opened, the worker reads its newest posts from Telegram again, so the
+timeline is never older than the last open. If the read fails (for example, the worker is stopped or Telegram
+refuses), the saved messages are shown for that open only, with a note. The next open tries Telegram again. A refresh
+reads back up to four pages (100 messages), so a channel with many new posts has no gap in its timeline.
+
+**Thumbnails.** The largest Telegram thumbnail of a media message up to 800 px (at most 150 KB) is uploaded to the
+public `thumbs` bucket of Supabase Storage, and the message keeps only its path. The bucket is created by migration
+005. Videos use the video's own thumbnail (a still frame). Stickers and messages without a JPEG or PNG thumbnail show
+the file box only. Each thumbnail is about 100 KB at most, and a refresh overwrites the same file, so the bucket does
+not grow when a channel is refreshed.
 
 Where the code lives: the `api` function builds and sends the download card (`_shared/card.ts`, `_shared/bale.ts`);
 `bale-webhook` handles lookups and the Accept and Decline taps (`_shared/webhook.ts`); the worker builds the lookup
@@ -181,10 +189,10 @@ the same expected text.
 
 Checked during the build:
 
-- Python worker: 98 unit tests. `cd worker && python -m unittest discover -s tests -t .`
-- Edge Function logic: 98 tests against an in-memory database fake. `node --test "supabase/functions/tests/*.test.ts"`
+- Python worker: 117 unit tests. `cd worker && python -m unittest discover -s tests -t .`
+- Edge Function logic: 101 tests against an in-memory database fake. `node --test "supabase/functions/tests/*.test.ts"`
   (Node 22.18 or newer, which strips types without a build step)
-- Frontend: 35 tests. `cd frontend && node --test "tests/*.test.js"`
+- Frontend: 37 tests. `cd frontend && node --test "tests/*.test.js"`
 - The webhook path is computed the same way in Python and TypeScript (checked against one shared test vector).
 
 Not verified (these need a live run before go-live):
@@ -208,7 +216,11 @@ Not verified (these need a live run before go-live):
   (its `from`, `message` and `data` fields are read the way Telegram sends them). Bale's docs read so far do not
   describe these. A card whose photo is refused is sent as text, but if the Accept and Decline buttons do nothing,
   check these calls first.
-- Telethon's thumbnail download (`download_media(..., thumb=0)`) on live messages.
+- Telethon's thumbnail download by size index (`download_media(..., thumb=<index>)`) on live messages, including
+  video thumbnails. The index follows Telethon's order for `photo.sizes` and `document.thumbs`.
+- Supabase Storage: the upload (`POST /storage/v1/object/thumbs/<path>` with `x-upsert`), the public URL, and the
+  `storage.buckets` insert in migration 005.
+- Fetching a stored thumbnail from the Edge Function for the Bale card (`fetch` of the public URL).
 - Bale's theme key names (`bg_color`, `text_color`, `hint_color`, `link_color`, and so on). The page uses them only
   when the SDK provides them, and it keeps its own colors otherwise.
 - The Vazirmatn font from Google Fonts. Without it the page uses Tahoma or the system font.

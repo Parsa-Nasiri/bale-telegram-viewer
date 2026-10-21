@@ -185,6 +185,19 @@ class FakeQueue:
         self.visibility[msg_id] = seconds
 
 
+class FakeThumbs:
+    """Stands in for ThumbStore: records the uploads, or fails them when `error` is set."""
+
+    def __init__(self) -> None:
+        self.puts: list[tuple[str, bytes, str]] = []
+        self.error: Exception | None = None
+
+    def put(self, path: str, data: bytes, content_type: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.puts.append((path, data, content_type))
+
+
 class FakeSource:
     def __init__(self) -> None:
         self.resolve_result: dict | Exception = {
@@ -193,6 +206,8 @@ class FakeSource:
             "title": "Chan",
         }
         self.pages: list[RawMessage] | Exception = []
+        # When not empty, each fetch_page call returns the next list here instead of `pages` (for paging tests).
+        self.page_queue: list[list[RawMessage]] = []
         self.message: RawMessage | None = None
         self.download_payload = b"data"
         self.download_delay = 0.0
@@ -209,6 +224,8 @@ class FakeSource:
 
     async def fetch_page(self, channel: dict, before_id: int | None, limit: int) -> list[RawMessage]:
         self.fetch_calls.append((before_id, limit))
+        if self.page_queue:
+            return list(self.page_queue.pop(0))
         if isinstance(self.pages, Exception):
             raise self.pages
         return list(self.pages)

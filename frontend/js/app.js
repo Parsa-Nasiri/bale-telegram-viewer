@@ -71,11 +71,14 @@ async function waitForRequest(requestId) {
   return { status: "failed", errorCode: "TIMEOUT" };
 }
 
-/** Loads one page. If the cache is short, the API queues an older fetch; wait for it, then read again. */
-async function fetchPage(channelId, before) {
+/**
+ * Loads one page. If the cache is short, the API queues an older fetch; wait for it, then read again.
+ * `allowFetch: false` reads the saved messages only.
+ */
+async function fetchPage(channelId, before, { allowFetch = true } = {}) {
   let page = null;
   for (let round = 0; round < MAX_FETCH_ROUNDS; round++) {
-    page = await callApi(() => api.listMessages(channelId, { before, limit: CONFIG.pageSize }));
+    page = await callApi(() => api.listMessages(channelId, { before, limit: CONFIG.pageSize, allowFetch }));
     if (!page.pendingRequestId) break;
     setStatus("در حال گرفتن پیام‌های بیشتر از کانال…");
     const finished = await waitForRequest(page.pendingRequestId);
@@ -84,20 +87,30 @@ async function fetchPage(channelId, before) {
   return page;
 }
 
+/**
+ * Asks the worker to read the channel from Telegram again, so the newest posts are always fresh. If that read fails
+ * and the channel is already saved, the saved messages are shown for this open only. The next open tries again.
+ * Returns the channel and the error code of the failed refresh (null when the refresh worked).
+ */
 async function openChannel(username) {
-  setStatus("در حال بررسی کانال…");
-  let result = await callApi(() => api.openChannel(username));
-  if (result.status === "pending") {
-    setStatus("در حال خواندن کانال از تلگرام…");
-    const finished = await waitForRequest(result.requestId);
-    if (finished.status === "failed") throw new ApiError(502, finished.errorCode ?? "OPEN_FAILED");
-    result = await callApi(() => api.openChannel(username));
+  setStatus("در حال خواندن کانال از تلگرام…");
+  const started = await callApi(() => api.openChannel(username));
+  const finished = await waitForRequest(started.requestId);
+  if (finished.status === "succeeded" && finished.channel) {
+    return { channel: finished.channel, refreshError: null };
   }
-  if (!result.channel) throw new ApiError(502, "CHANNEL_NOT_READY");
-  return result.channel;
+  if (started.channel) {
+    return { channel: started.channel, refreshError: finished.errorCode ?? "FETCH_FAILED" };
+  }
+  throw new ApiError(502, finished.errorCode ?? "OPEN_FAILED");
 }
 
-async function loadChannel(channel) {
+function listStatus(refreshError, count) {
+  if (refreshError) return `به‌روزرسانی نشد. ${errorLabel(refreshError)} فعلاً پیام‌های ذخیره‌شده نمایش داده می‌شوند.`;
+  return count > 0 ? "" : "پیامی برای نمایش نیست.";
+}
+
+async function loadChannel({ channel, refreshError }) {
   state.generation += 1;
   state.channel = channel;
   state.messages = [];
@@ -106,13 +119,14 @@ async function loadChannel(channel) {
   els.title.textContent = channel.title || `@${channel.username}`;
   messageList.showSkeleton();
 
-  const page = await fetchPage(channel.id, undefined);
+  // After a failed refresh, the saved messages are read without asking Telegram again.
+  const page = await fetchPage(channel.id, undefined, { allowFetch: refreshError === null });
   state.messages = page.items;
   state.nextCursor = page.nextCursor;
   state.hasMore = page.hasMore;
   messageList.setAll(state.messages);
   els.timeline.scrollTop = els.timeline.scrollHeight;
-  setStatus(state.messages.length > 0 ? "" : "پیامی برای نمایش نیست.");
+  setStatus(listStatus(refreshError, state.messages.length));
   fillViewportIfNeeded();
 }
 
@@ -185,8 +199,8 @@ els.form.addEventListener("submit", async (event) => {
   if (!username) return;
   els.openButton.disabled = true;
   try {
-    const channel = await openChannel(username);
-    await loadChannel(channel);
+    const opened = await openChannel(username);
+    await loadChannel(opened);
   } catch (err) {
     setStatus(errorLabel(err?.code), true);
     if (state.messages.length === 0) messageList.setAll([]);

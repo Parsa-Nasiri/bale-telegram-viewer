@@ -12,7 +12,7 @@ from bale_viewer_worker.queue_ops import JOB_QUEUE, PAGE_QUEUE
 from bale_viewer_worker.runner import SESSION_KEY, Runner
 from bale_viewer_worker.watchdog import decide
 
-from tests.fakes import FakeBale, FakeQueue, FakeSource, FakeStore, photo
+from tests.fakes import FakeBale, FakeQueue, FakeSource, FakeStore, photo, FakeThumbs
 
 
 def _settings(temp_dir: str, **overrides) -> Settings:
@@ -40,8 +40,14 @@ class PageRequestTests(unittest.TestCase):
         self.queue = FakeQueue()
         self.source = FakeSource()
         self.settings = _settings(self.tmp.name)
+        self.thumbs = FakeThumbs()
         self.pipeline = Pipeline(
-            settings=self.settings, store=self.store, queue=self.queue, source=self.source, bale=FakeBale()
+            settings=self.settings,
+            store=self.store,
+            queue=self.queue,
+            source=self.source,
+            bale=FakeBale(),
+            thumbs=self.thumbs,
         )
 
     def tearDown(self):
@@ -132,7 +138,12 @@ class DownloadJobTests(unittest.TestCase):
 
     def _run(self, job_id="j1", msg_id=7):
         pipeline = Pipeline(
-            settings=self.settings, store=self.store, queue=self.queue, source=self.source, bale=self.bale
+            settings=self.settings,
+            store=self.store,
+            queue=self.queue,
+            source=self.source,
+            bale=self.bale,
+            thumbs=FakeThumbs(),
         )
         asyncio.run(pipeline.handle_job({"msg_id": msg_id, "message": {"job_id": job_id}}))
 

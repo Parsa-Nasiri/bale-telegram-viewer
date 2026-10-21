@@ -25,9 +25,13 @@ from .message_mapper import RawMessage, to_row
 from .policy import AWAITING_STATE, MAX_ACTIVE_JOBS, RUNNABLE_JOB_STATES, backoff_seconds, sanitize_filename
 from .queue_ops import JOB_QUEUE, LOOKUP_QUEUE, PAGE_QUEUE, QueueOps
 from .store import JOB_TABLE, LOOKUP_TABLE, PAGE_TABLE, Store
+from .thumb_store import thumb_path
+from .thumbs import CONTENT_TYPES, image_extension
 
 log = logging.getLogger(__name__)
 _CAPTION_LIMIT = 1024
+# A refresh of a channel reads back this many pages (25 messages each) at most, until it reaches cached messages.
+MAX_REFRESH_PAGES = 4
 
 _LOOKUP_REPLIES = {
     "CHANNEL_NOT_FOUND": "کانالی با این نام پیدا نشد.",
@@ -55,12 +59,14 @@ class Pipeline:
         queue: QueueOps,
         source: Any,
         bale: BaleClient,
+        thumbs: Any,
     ) -> None:
         self.settings = settings
         self.store = store
         self.queue = queue
         self.source = source
         self.bale = bale
+        self.thumbs = thumbs  # ThumbStore: where thumbnails are kept, see thumb_store.py
 
     # ----------------------------------------------------------------- channel pages
     async def handle_page(self, msg: dict[str, Any]) -> None:
@@ -74,9 +80,8 @@ class Pipeline:
             return
         try:
             channel = await self._channel_for_request(req)
-            before = req.get("before_message_id") if req["kind"] == "older" else None
-            raws = await self.source.fetch_page(channel, before, self.settings.page_size)
-            self._store_page(req, channel, raws)
+            raws, short_page = await self._fetch_pages(req, channel)
+            self._store_page(req, channel, raws, short_page)
             self.store.cas(PAGE_TABLE, req, "succeeded", channel_id=channel["id"], error_code=None)
             self.queue.delete(PAGE_QUEUE, msg_id)
         except AppError as exc:
@@ -94,12 +99,57 @@ class Pipeline:
             raise AppError("CHANNEL_NOT_FOUND", "older request without a known channel")
         return channel
 
-    def _store_page(self, req: dict[str, Any], channel: dict[str, Any], raws: list[RawMessage]) -> None:
+    async def _fetch_pages(self, req: dict[str, Any], channel: dict[str, Any]) -> tuple[list[RawMessage], bool]:
+        """The messages the request asks for, and whether the last page read was short (the end of the history).
+
+        A refresh of a channel reads newest first and keeps going back until it reaches messages already cached.
+        Without that, a channel with many new posts would have a hole in its timeline between the new messages and
+        the old cache. The loop stops after MAX_REFRESH_PAGES pages, so a very busy channel cannot hold a request.
+        """
+        size = self.settings.page_size
+        before = req.get("before_message_id") if req["kind"] == "older" else None
+        page = await self.source.fetch_page(channel, before, size)
+        raws = list(page)
+        if req["kind"] != "open":
+            return raws, len(page) < size
+        cached_newest = (self.store.get_sync(channel["id"]) or {}).get("newest_message_id")
+        rounds = 1
+        while (
+            cached_newest
+            and page
+            and len(page) == size
+            and min(raw.id for raw in page) > cached_newest
+            and rounds < MAX_REFRESH_PAGES
+        ):
+            page = await self.source.fetch_page(channel, min(raw.id for raw in page), size)
+            raws.extend(page)
+            rounds += 1
+        return raws, len(page) < size
+
+    def _upload_thumbs(self, channel_id: str, raws: list[RawMessage]) -> dict[int, str]:
+        """Stores each message's thumbnail and returns the storage path per message id. A failed upload only
+        leaves that message without a thumbnail; the message itself is still cached."""
+        paths: dict[int, str] = {}
+        for raw in raws:
+            extension = image_extension(raw.thumb)
+            if extension is None:
+                continue
+            path = thumb_path(channel_id, raw.id, extension)
+            try:
+                self.thumbs.put(path, raw.thumb, CONTENT_TYPES[extension])
+            except Exception as exc:  # noqa: BLE001 - a thumbnail is optional
+                log.warning("could not store a thumbnail (%s)", type(exc).__name__)
+                continue
+            paths[raw.id] = path
+        return paths
+
+    def _store_page(self, req: dict[str, Any], channel: dict[str, Any], raws: list[RawMessage], short_page: bool) -> None:
         channel_id = channel["id"]
-        self.store.upsert_messages([to_row(raw, channel_id) for raw in raws])
+        paths = self._upload_thumbs(channel_id, raws)
+        self.store.upsert_messages([to_row(raw, channel_id, paths.get(raw.id)) for raw in raws])
         ids = [raw.id for raw in raws]
         sync = self.store.get_sync(channel_id) or {}
-        exhausted = bool(sync.get("history_exhausted")) or len(raws) < self.settings.page_size
+        exhausted = bool(sync.get("history_exhausted")) or short_page
         newest = max(ids + [sync.get("newest_message_id") or 0]) if ids else sync.get("newest_message_id")
         if req["kind"] == "older":
             oldest = min(ids) if ids else sync.get("oldest_message_id")
@@ -147,7 +197,8 @@ class Pipeline:
         if raw is None:
             raise AppError("MESSAGE_NOT_FOUND")
         # Cache the message, so the Mini App shows it too.
-        self.store.upsert_messages([to_row(raw, channel["id"])])
+        paths = self._upload_thumbs(channel["id"], [raw])
+        self.store.upsert_messages([to_row(raw, channel["id"], paths.get(raw.id))])
 
         job = self._job_for_card(lookup["user_id"], channel["id"], raw) if self._deliverable(raw) else None
         caption = build_caption(card_input(channel, raw), DOWNLOAD_QUESTION if job else None)

@@ -98,6 +98,7 @@ async def run_worker(settings: Settings, *, drain_after: int, hard_stop: int) ->
             queue=ctx.queue,
             source=source,
             bale=ctx.bale,
+            thumbs=ctx.thumbs,
         )
         runner = Runner(
             settings=settings,

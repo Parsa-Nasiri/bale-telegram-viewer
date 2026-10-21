@@ -8,6 +8,7 @@ import { deriveTokenSecret, deriveWebhookPath } from "./derive.ts";
 import { readEnv, requireEnv } from "./env.ts";
 
 export interface ApiConfig {
+  supabaseUrl: string;
   botToken: string;
   tokenSecret: string;
   allowedOrigins: readonly string[];
@@ -17,7 +18,6 @@ export interface ApiConfig {
 }
 
 export interface FunctionConfig extends ApiConfig {
-  supabaseUrl: string;
   serviceKey: string;
   webhookSecret: string;
 }

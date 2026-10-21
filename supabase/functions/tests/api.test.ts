@@ -16,6 +16,7 @@ const OTHER_USER_ID = "33333333-3333-4333-8333-333333333333";
 const ISO_NOW = new Date(NOW * 1000).toISOString();
 
 const config: ApiConfig = {
+  supabaseUrl: "https://project.example.supabase.co",
   botToken: "123456:TEST-BOT-TOKEN",
   tokenSecret: "t".repeat(40),
   allowedOrigins: [ORIGIN],
@@ -56,9 +57,13 @@ function seed(overrides: Record<string, Row[]> = {}): FakeDb {
   });
 }
 
-function depsFor(db: FakeDb, bale: FakeBale = new FakeBale()): ApiDeps {
-  return { config, db: db as unknown as Db, bale, now: () => NOW };
+function depsFor(db: FakeDb, bale: FakeBale = new FakeBale(), loadThumb?: ApiDeps["loadThumb"]): ApiDeps {
+  return { config, db: db as unknown as Db, bale, now: () => NOW, loadThumb };
 }
+
+// The stored thumbnail of message 10, and a loader that returns three bytes for it.
+const STORED_THUMB = `${CHANNEL_ID}/10.jpg`;
+const loadThreeBytes = async () => new Uint8Array([1, 2, 3]);
 
 async function tokenFor(uid: string): Promise<string> {
   return signToken({ uid, exp: NOW + 600 }, config.tokenSecret);
@@ -209,12 +214,12 @@ describe("GET /channels/:id/messages", () => {
     assert.equal(db.inserts.length, 0);
   });
 
-  it("includes a thumbnail only when the cached message has a valid image", async () => {
-    const thumb = "data:image/jpeg;base64,AAAA";
+  it("includes the public URL of a stored thumbnail only when the path is one the worker writes", async () => {
     const db = seed({
       messages: [
-        message(9, { media_type: "photo", metadata: { available: true, size_bytes: 10, thumb } }),
-        message(10, { media_type: "document", metadata: { available: true, thumb: "https://example.com/x.jpg" } }),
+        message(9, { media_type: "photo", metadata: { available: true, size_bytes: 10, thumb_path: `${CHANNEL_ID}/9.jpg` } }),
+        message(10, { media_type: "document", metadata: { available: true, thumb_path: "https://example.com/x.jpg" } }),
+        message(8, { media_type: "photo", metadata: { available: true, thumb: "data:image/jpeg;base64,AAAA" } }),
       ],
     });
     const body = await (
@@ -222,7 +227,20 @@ describe("GET /channels/:id/messages", () => {
     ).json();
     assert.deepEqual(
       body.items.map((item: { thumb: string | null }) => item.thumb),
-      [thumb, null],
+      [null, `${config.supabaseUrl}/storage/v1/object/public/thumbs/${CHANNEL_ID}/9.jpg`, null],
+    );
+  });
+
+  it("reads the cache only when fetch=0, so a failed refresh does not queue another Telegram read", async () => {
+    const db = seed({ messages: [message(1), message(2), message(3)] });
+    const body = await (
+      await call(depsFor(db), "GET", `/channels/${CHANNEL_ID}/messages?limit=5&fetch=0`, { token: await tokenFor(USER_ID) })
+    ).json();
+    assert.equal(body.pendingRequestId, null);
+    assert.equal(db.inserts.length, 0);
+    assert.deepEqual(
+      body.items.map((item: { id: number }) => item.id),
+      [1, 2, 3],
     );
   });
 
@@ -236,15 +254,20 @@ describe("GET /channels/:id/messages", () => {
 });
 
 describe("POST /channels/open", () => {
-  it("returns the channel at once when it is already cached", async () => {
-    const res = await call(depsFor(seed()), "POST", "/channels/open", {
+  it("always queues a refresh, and returns the cached channel with it", async () => {
+    const db = seed();
+    const res = await call(depsFor(db), "POST", "/channels/open", {
       token: await tokenFor(USER_ID),
       body: { username: "@News_Channel" },
     });
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 202);
     const body = await res.json();
-    assert.equal(body.status, "ready");
+    assert.equal(body.status, "pending");
+    assert.equal(typeof body.requestId, "string");
     assert.equal(body.channel.id, CHANNEL_ID);
+    const request = db.inserts.find((insert) => insert.table === "page_requests");
+    assert.equal(request?.row.kind, "open");
+    assert.equal(request?.row.username, "news_channel");
   });
 
   it("queues an unknown channel once, even when the user asks twice", async () => {
@@ -285,6 +308,27 @@ describe("POST /channels/open", () => {
 });
 
 describe("GET /requests/:id", () => {
+  it("returns the channel once the worker has read it", async () => {
+    const db = seed({
+      page_requests: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          user_id: USER_ID,
+          kind: "open",
+          status: "succeeded",
+          channel_id: CHANNEL_ID,
+        },
+      ],
+    });
+    const res = await call(depsFor(db), "GET", "/requests/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", {
+      token: await tokenFor(USER_ID),
+    });
+    const body = await res.json();
+    assert.equal(body.status, "succeeded");
+    assert.equal(body.channel.id, CHANNEL_ID);
+    assert.equal(body.channel.username, "news_channel");
+  });
+
   it("does not reveal requests owned by another user", async () => {
     const db = seed({
       page_requests: [
@@ -339,35 +383,58 @@ describe("POST /downloads", () => {
     assert.equal(stored?.values.confirm_message_id, String(bale.sent[0].messageId));
   });
 
-  it("sends the card as a photo when the message has a thumbnail", async () => {
-    const thumb = `data:image/jpeg;base64,${Buffer.from([1, 2, 3]).toString("base64")}`;
+  it("sends the card as a photo when the message has a stored thumbnail", async () => {
     const db = seed({
       users: linkedUsers,
       messages: [
         message(10, {
           media_type: "document",
-          metadata: { available: true, size_bytes: 1000, file_name: "a.pdf", thumb },
+          metadata: { available: true, size_bytes: 1000, file_name: "a.pdf", thumb_path: STORED_THUMB },
         }),
       ],
     });
     const bale = new FakeBale();
-    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+    const res = await call(depsFor(db, bale, loadThreeBytes), "POST", "/downloads", {
+      token: await tokenFor(USER_ID),
+      body,
+    });
     assert.equal(res.status, 202);
     assert.equal(bale.sent[0].kind, "photo");
     assert.equal(bale.sent[0].photoBytes, 3);
   });
 
-  it("falls back to a text card when Bale refuses the photo", async () => {
-    const thumb = `data:image/jpeg;base64,${Buffer.from([1, 2, 3]).toString("base64")}`;
+  it("sends a text card when the stored thumbnail cannot be loaded", async () => {
     const db = seed({
       users: linkedUsers,
       messages: [
-        message(10, { media_type: "document", metadata: { available: true, size_bytes: 1000, thumb } }),
+        message(10, { media_type: "document", metadata: { available: true, size_bytes: 1000, thumb_path: STORED_THUMB } }),
+      ],
+    });
+    const bale = new FakeBale();
+    const res = await call(depsFor(db, bale, async () => null), "POST", "/downloads", {
+      token: await tokenFor(USER_ID),
+      body,
+    });
+    assert.equal(res.status, 202);
+    assert.equal(bale.sent[0].kind, "message");
+  });
+
+  it("falls back to a text card when Bale refuses the photo", async () => {
+    const db = seed({
+      users: linkedUsers,
+      messages: [
+        message(10, {
+          media_type: "document",
+          metadata: { available: true, size_bytes: 1000, thumb_path: STORED_THUMB },
+        }),
       ],
     });
     const bale = new FakeBale();
     bale.failPhoto = true;
-    const res = await call(depsFor(db, bale), "POST", "/downloads", { token: await tokenFor(USER_ID), body });
+    const res = await call(depsFor(db, bale, loadThreeBytes), "POST", "/downloads", {
+      token: await tokenFor(USER_ID),
+      body,
+    });
     assert.equal(res.status, 202);
     assert.equal(bale.sent[0].kind, "message");
   });

@@ -77,25 +77,19 @@ export class BaleBot implements BaleApi {
   }
 }
 
-/** Decodes a data:image URL (base64) into bytes. */
-export function thumbBytes(dataUrl: string): Uint8Array {
-  const binary = atob(dataUrl.slice(dataUrl.indexOf(",") + 1));
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
-}
-
 /**
  * Sends a card with its buttons. With a thumbnail it is sent as a photo; if the photo is refused, the same text
  * goes out as a plain message, so a bad thumbnail never stops the card. Returns the Bale message id, if any.
  */
 export async function sendCard(
   bale: BaleApi,
-  input: { chatId: number; caption: string; replyMarkup?: unknown; thumb: string | null },
+  input: { chatId: number; caption: string; replyMarkup?: unknown; thumb: Uint8Array | null },
 ): Promise<number | null> {
   if (input.thumb) {
     try {
       const sent = await bale.sendPhoto({
         chatId: input.chatId,
-        photo: thumbBytes(input.thumb),
+        photo: input.thumb,
         caption: input.caption,
         replyMarkup: input.replyMarkup,
       });

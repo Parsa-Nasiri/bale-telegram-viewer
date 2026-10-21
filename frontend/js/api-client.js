@@ -53,10 +53,12 @@ export function createApi({ baseUrl = CONFIG.apiBaseUrl, fetchImpl = (input, ini
     getRequest(requestId) {
       return request("GET", `/requests/${encodeURIComponent(requestId)}`);
     },
-    listMessages(channelId, { before, limit } = {}) {
+    listMessages(channelId, { before, limit, allowFetch = true } = {}) {
       const params = new URLSearchParams();
       if (before !== undefined && before !== null) params.set("before", String(before));
       if (limit) params.set("limit", String(limit));
+      // Reads the saved messages only. Used when the refresh of the channel failed.
+      if (allowFetch === false) params.set("fetch", "0");
       const query = params.toString();
       return request("GET", `/channels/${encodeURIComponent(channelId)}/messages${query ? `?${query}` : ""}`);
     },

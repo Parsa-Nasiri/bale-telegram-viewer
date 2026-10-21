@@ -10,6 +10,7 @@ from .github_chain import GitHubChain
 from .queue_ops import QueueOps
 from .store import Store
 from .supabase_rest import SupabaseRest
+from .thumb_store import ThumbStore
 from .transport import Transport, UrllibTransport
 
 
@@ -19,12 +20,14 @@ class Context:
     store: Store
     queue: QueueOps
     bale: BaleClient | None
+    thumbs: ThumbStore
     github: GitHubChain | None
 
 
 def build_context(settings: Settings, transport: Transport | None = None) -> Context:
     transport = transport or UrllibTransport()
     rest = SupabaseRest(settings.supabase_url, settings.supabase_service_role_key, transport)
+    thumbs = ThumbStore(settings.supabase_url, settings.supabase_service_role_key, transport)
     bale = BaleClient(settings.bale_api_base_url, settings.bale_bot_token, transport) if settings.bale_bot_token else None
     github = None
     if settings.github_repository and settings.github_token:
@@ -35,4 +38,11 @@ def build_context(settings: Settings, transport: Transport | None = None) -> Con
             settings.github_token,
             transport,
         )
-    return Context(settings=settings, store=Store(rest), queue=QueueOps(rest), bale=bale, github=github)
+    return Context(
+        settings=settings,
+        store=Store(rest),
+        queue=QueueOps(rest),
+        bale=bale,
+        thumbs=thumbs,
+        github=github,
+    )

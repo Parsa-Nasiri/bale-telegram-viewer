@@ -10,8 +10,9 @@ export const MAX_PAGE_REQUESTS_PER_HOUR = 60;
 export const MAX_LOOKUPS_PER_HOUR = 30;
 /** A download card the user has not answered expires after this many seconds. */
 export const CONFIRM_TTL_SECONDS = 30 * 60;
-/** Thumbnails are stored as data URLs in message metadata. Larger ones are not used (about 30 KB of image). */
-export const MAX_THUMB_CHARS = 40_000;
+/** Thumbnails are stored in the public `thumbs` bucket of Supabase Storage (see worker/bale_viewer_worker/thumb_store.py). */
+export const THUMB_BUCKET = "thumbs";
+const THUMB_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[1-9][0-9]{0,18}\.(jpg|png)$/i;
 
 export const AWAITING_STATE = "awaiting_confirmation";
 export const ACTIVE_JOB_STATES = ["queued", "processing", "downloading", "uploading"];
@@ -97,7 +98,7 @@ export interface CachedMetadata {
   mime_type?: string | null;
   size_bytes?: number | null;
   available?: boolean;
-  thumb?: unknown;
+  thumb_path?: unknown;
 }
 
 export interface CachedMessage {
@@ -176,9 +177,8 @@ export function isLiveJob(job: JobState, now: number): boolean {
   return ACTIVE_JOB_STATES.includes(job.status);
 }
 
-/** Returns the thumbnail data URL when it is an image and small enough to store and send; otherwise null. */
-export function validThumb(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  if (!value.startsWith("data:image/") || value.length > MAX_THUMB_CHARS) return null;
-  return value;
+/** The public URL of a stored thumbnail, or null when the path is not one the worker writes. */
+export function thumbUrl(supabaseUrl: string, path: unknown): string | null {
+  if (typeof path !== "string" || !THUMB_PATH.test(path)) return null;
+  return `${supabaseUrl}/storage/v1/object/public/${THUMB_BUCKET}/${path}`;
 }

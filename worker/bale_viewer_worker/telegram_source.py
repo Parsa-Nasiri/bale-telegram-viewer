@@ -16,6 +16,7 @@ from typing import Any
 
 from .errors import AppError
 from .message_mapper import RawMessage
+from .thumbs import ThumbOption, choose_thumb, image_extension
 
 
 def _detect_kind(message: Any) -> str | None:
@@ -36,6 +37,29 @@ def _detect_kind(message: Any) -> str | None:
     if message.media is not None:
         return "unknown"
     return None
+
+
+def _thumb_options(message: Any) -> list[ThumbOption]:
+    """The thumbnail sizes Telegram offers for a message, with the index Telethon uses to download each one."""
+    if message.photo:
+        sizes = getattr(message.photo, "sizes", None) or []
+    elif message.document:
+        sizes = getattr(message.document, "thumbs", None) or []
+    else:
+        sizes = []
+    options: list[ThumbOption] = []
+    for index, size in enumerate(sizes):
+        width = getattr(size, "w", None)
+        height = getattr(size, "h", None)
+        if not width or not height:
+            continue  # stripped and empty sizes have no dimensions, so they are never the best choice
+        nbytes = getattr(size, "size", None)
+        if nbytes is None and getattr(size, "bytes", None):
+            nbytes = len(size.bytes)
+        if nbytes is None and getattr(size, "sizes", None):  # progressive sizes list their byte counts
+            nbytes = max(size.sizes)
+        options.append(ThumbOption(index, int(width), int(height), int(nbytes) if nbytes is not None else None))
+    return options
 
 
 def to_raw(message: Any) -> RawMessage:
@@ -88,14 +112,19 @@ class TelegramSource:
             raise AppError("CHANNEL_ACCESS_DENIED") from exc
 
     async def _with_thumb(self, message: Any, raw: RawMessage) -> RawMessage:
-        """Attaches the smallest thumbnail of a media message. Best effort: the thumbnail is optional."""
+        """Attaches the best thumbnail of a media message. Best effort: the thumbnail is optional."""
         if raw.media_kind in (None, "unknown"):
             return raw
+        index = choose_thumb(_thumb_options(message))
+        if index is None:
+            return raw
         try:
-            data = await self._client.download_media(message, file=bytes, thumb=0)
+            data = await self._client.download_media(message, file=bytes, thumb=index)
         except Exception:  # noqa: BLE001 - a missing thumbnail must never stop the message itself
             return raw
-        return replace(raw, thumb=data) if isinstance(data, bytes) and data else raw
+        if not isinstance(data, bytes) or image_extension(data) is None:
+            return raw
+        return replace(raw, thumb=data)
 
     async def resolve(self, username: str) -> dict:
         """Return {telegram_peer_id, username, title} for a public channel username."""

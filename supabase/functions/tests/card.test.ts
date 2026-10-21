@@ -14,12 +14,11 @@ import {
 } from "../_shared/card.ts";
 import {
   CONFIRM_TTL_SECONDS,
-  MAX_THUMB_CHARS,
   isAwaitingExpired,
   isLiveJob,
   parseConfirmData,
   parseMessageLink,
-  validThumb,
+  thumbUrl,
 } from "../_shared/logic.ts";
 
 const NOW = 1_800_000_000;
@@ -82,14 +81,20 @@ describe("download slots and confirmation expiry", () => {
 });
 
 describe("thumbnails", () => {
-  it("accepts a small image data URL", () => {
-    assert.equal(validThumb("data:image/png;base64,AAAA"), "data:image/png;base64,AAAA");
+  const base = "https://project.example.supabase.co";
+  const path = "11111111-1111-4111-8111-111111111111/10.jpg";
+
+  it("builds the public URL of a stored thumbnail", () => {
+    assert.equal(thumbUrl(base, path), `${base}/storage/v1/object/public/thumbs/${path}`);
   });
 
-  it("rejects links, non-strings and oversized images", () => {
-    assert.equal(validThumb("https://example.com/x.jpg"), null);
-    assert.equal(validThumb(5), null);
-    assert.equal(validThumb(`data:image/jpeg;base64,${"A".repeat(MAX_THUMB_CHARS)}`), null);
+  it("accepts only the paths the worker writes", () => {
+    assert.equal(thumbUrl(base, "https://example.com/x.jpg"), null);
+    assert.equal(thumbUrl(base, "data:image/png;base64,AAAA"), null);
+    assert.equal(thumbUrl(base, "not-a-uuid/10.jpg"), null);
+    assert.equal(thumbUrl(base, "11111111-1111-4111-8111-111111111111/10.gif"), null);
+    assert.equal(thumbUrl(base, "11111111-1111-4111-8111-111111111111/../10.jpg"), null);
+    assert.equal(thumbUrl(base, 5), null);
   });
 });
 

@@ -18,7 +18,7 @@ import {
   normalizeUsername,
   parseCursor,
   segmentsAfter,
-  validThumb,
+  thumbUrl,
 } from "./logic.ts";
 import { enqueue, PAGE_QUEUE } from "./queue.ts";
 import type { Db } from "./rest.ts";
@@ -29,7 +29,12 @@ export interface ApiDeps {
   db: Db;
   bale: BaleApi;
   now: () => number; // unix seconds
+  /** Reads a stored thumbnail for a Bale card. Tests replace it; a failure means the card has no photo. */
+  loadThumb?: (url: string) => Promise<Uint8Array | null>;
 }
+
+// A stored thumbnail is at most 150 KB (see worker/bale_viewer_worker/thumbs.py). Anything much bigger is not used.
+const MAX_CARD_THUMB_BYTES = 1_000_000;
 
 const CHANNEL_COLUMNS = "id,username,title";
 const MESSAGE_COLUMNS = "message_id,date,text,media_type,group_id,metadata";
@@ -57,7 +62,7 @@ interface MessageMetadata {
   mime_type?: string | null;
   size_bytes?: number | null;
   available?: boolean;
-  thumb?: unknown;
+  thumb_path?: unknown;
 }
 
 interface MessageRow {
@@ -155,20 +160,27 @@ async function authenticate(req: Request, deps: ApiDeps, cors: Cors): Promise<Re
   return jsonResponse({ token, expiresAt, hasBaleChat: user.bale_chat_id !== null }, 200, cors);
 }
 
+/**
+ * Every open asks the worker to read the channel from Telegram again, so the newest posts are always fetched.
+ * A channel already in the cache is returned with the request, so the Mini App can show the saved messages if
+ * the refresh fails. Repeated opens of a channel with a pending refresh reuse that request.
+ */
 async function openChannel(req: Request, deps: ApiDeps, cors: Cors): Promise<Response> {
   const uid = await requireUser(req, deps);
   const body = await readJson(req);
   const username = normalizeUsername(body.username);
   if (!username) throw new HttpError(400, "INVALID_USERNAME");
 
-  const channel = await deps.db.selectOne<ChannelRow>("channels", {
+  const cached = await deps.db.selectOne<ChannelRow>("channels", {
     select: CHANNEL_COLUMNS,
     username: `eq.${username}`,
   });
-  if (channel) return jsonResponse({ status: "ready", channel: toChannel(channel) }, 200, cors);
-
   const requestId = await submitPageRequest(deps, uid, { kind: "open", username });
-  return jsonResponse({ status: "pending", requestId }, 202, cors);
+  return jsonResponse(
+    { status: "pending", requestId, channel: cached ? toChannel(cached) : null },
+    202,
+    cors,
+  );
 }
 
 async function getRequest(req: Request, id: string | undefined, deps: ApiDeps, cors: Cors): Promise<Response> {
@@ -180,8 +192,18 @@ async function getRequest(req: Request, id: string | undefined, deps: ApiDeps, c
     user_id: `eq.${uid}`,
   });
   if (!row) throw new HttpError(404, "REQUEST_NOT_FOUND");
+  // Once the worker has read the channel, the answer carries it, so the Mini App needs no second open call.
+  const channel = row.channel_id
+    ? await deps.db.selectOne<ChannelRow>("channels", { select: CHANNEL_COLUMNS, id: `eq.${row.channel_id}` })
+    : null;
   return jsonResponse(
-    { id: row.id, status: row.status, errorCode: row.error_code, channelId: row.channel_id },
+    {
+      id: row.id,
+      status: row.status,
+      errorCode: row.error_code,
+      channelId: row.channel_id,
+      channel: channel ? toChannel(channel) : null,
+    },
     200,
     cors,
   );
@@ -205,6 +227,9 @@ async function listMessages(
 
   const limit = clampLimit(url.searchParams.get("limit"));
   const before = parseCursor(url.searchParams.get("before"));
+  // fetch=0 reads the cache only. The Mini App uses it when a refresh failed, so the page does not queue
+  // another Telegram read that is likely to fail the same way.
+  const mayFetch = url.searchParams.get("fetch") !== "0";
   const sync = await deps.db.selectOne<SyncRow>("channel_sync", {
     select: "oldest_message_id,history_exhausted",
     channel_id: `eq.${channelId}`,
@@ -228,7 +253,7 @@ async function listMessages(
   );
 
   let pendingRequestId: string | null = null;
-  if (meta.needsOlderFetch && meta.cursorForFetch !== null) {
+  if (mayFetch && meta.needsOlderFetch && meta.cursorForFetch !== null) {
     pendingRequestId = await submitPageRequest(deps, uid, {
       kind: "older",
       channelId,
@@ -240,7 +265,10 @@ async function listMessages(
     {
       channel: toChannel(channel),
       // Chronological order for display: oldest at the top, newest at the bottom.
-      items: rows.slice().reverse().map(toMessage),
+      items: rows
+        .slice()
+        .reverse()
+        .map((row) => toMessage(row, deps.config.supabaseUrl)),
       nextCursor: meta.nextCursor,
       hasMore: meta.hasMore,
       pendingRequestId,
@@ -306,13 +334,14 @@ async function createDownload(req: Request, deps: ApiDeps, cors: Cors): Promise<
   });
 
   const card: CardInput = cardInputFrom(channel, message);
+  const thumb = await loadCardThumb(deps, message.metadata?.thumb_path);
   let confirmMessageId: number | null;
   try {
     confirmMessageId = await sendCard(deps.bale, {
       chatId: Number(user.bale_chat_id),
       caption: buildCaption(card, DOWNLOAD_QUESTION),
       replyMarkup: confirmKeyboard(job.id),
-      thumb: validThumb(message.metadata?.thumb),
+      thumb,
     });
   } catch {
     await deps.db.update(
@@ -348,6 +377,21 @@ async function getDownload(req: Request, id: string | undefined, deps: ApiDeps, 
     200,
     cors,
   );
+}
+
+/** The stored thumbnail of a message as bytes for the Bale card. Any failure returns null: the card has no photo. */
+async function loadCardThumb(deps: ApiDeps, path: unknown): Promise<Uint8Array | null> {
+  const url = thumbUrl(deps.config.supabaseUrl, path);
+  if (url === null) return null;
+  if (deps.loadThumb) return deps.loadThumb(url);
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return bytes.byteLength > 0 && bytes.byteLength <= MAX_CARD_THUMB_BYTES ? bytes : null;
+  } catch {
+    return null;
+  }
 }
 
 type PageRequest = { kind: "open"; username: string } | { kind: "older"; channelId: string; beforeMessageId: number };
@@ -403,7 +447,7 @@ function toChannel(row: ChannelRow) {
   return { id: row.id, username: row.username, title: row.title };
 }
 
-function toMessage(row: MessageRow) {
+function toMessage(row: MessageRow, supabaseUrl: string) {
   const meta = row.metadata ?? {};
   return {
     id: row.message_id,
@@ -415,7 +459,7 @@ function toMessage(row: MessageRow) {
     fileName: meta.file_name ?? null,
     mimeType: meta.mime_type ?? null,
     sizeBytes: meta.size_bytes ?? null,
-    thumb: validThumb(meta.thumb),
+    thumb: thumbUrl(supabaseUrl, meta.thumb_path),
     downloadable: meta.available === true && row.media_type !== null,
   };
 }

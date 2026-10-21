@@ -42,16 +42,23 @@ export function createMockApi({ delayMs = 120, total = 240 } = {}) {
       return { token: "mock", expiresAt: 0, hasBaleChat: true };
     },
 
+    // Like the real API: every open is a refresh request. The channel is included only when it is already saved.
     async openChannel(username) {
       await wait();
       const name = String(username).replace(/^@/, "").toLowerCase();
       if (name !== MOCK_CHANNEL.username) throw new ApiError(404, "CHANNEL_NOT_FOUND");
-      return { status: "ready", channel: { ...MOCK_CHANNEL } };
+      return { status: "pending", requestId: "mock-request", channel: null };
     },
 
     async getRequest(requestId) {
       await wait();
-      return { id: requestId, status: "succeeded", errorCode: null, channelId: MOCK_CHANNEL.id };
+      return {
+        id: requestId,
+        status: "succeeded",
+        errorCode: null,
+        channelId: MOCK_CHANNEL.id,
+        channel: { ...MOCK_CHANNEL },
+      };
     },
 
     async listMessages(_channelId, { before = null, limit = 25 } = {}) {
